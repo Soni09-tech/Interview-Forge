@@ -71,7 +71,7 @@ setx ANTHROPIC_API_KEY "your-key-here"        # Windows (new terminal after)
 python app.py
 ```
 
-Open **http://localhost:5000** in your browser.
+Open **https://interview-forge-x9g8.onrender.com** in your browser.
 
 For production WSGI hosting, use the included `Procfile` (or run the
 equivalent command):
