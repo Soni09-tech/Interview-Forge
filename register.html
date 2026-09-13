@@ -1,0 +1,36 @@
+{% extends "layout.html" %}
+{% block title %}Create account · InterviewForge{% endblock %}
+{% block content %}
+<section class="auth-card auth-gate auth-register">
+  <p class="kicker">Build your placement plan</p>
+  <h1>Create your account</h1>
+  <p class="auth-lede">Save your progress, target a role, and unlock the complete InterviewForge journey.</p>
+  <form method="post" class="auth-form" data-auth-form>
+    <div class="auth-section-heading">Your details</div>
+    <label class="field"><span>Full name</span><input name="name" maxlength="80" autocomplete="name" required></label>
+    <label class="field"><span>Email address</span><input name="email" type="email" autocomplete="email" required></label>
+    <div class="form-row">
+      <label class="field"><span>Phone number</span><input name="phone" type="tel" maxlength="30" placeholder="+91 98765 43210"></label>
+      <label class="field"><span>Graduation year</span><input name="graduation_year" type="number" min="1950" max="2100" placeholder="2026"></label>
+    </div>
+    <div class="auth-section-heading">Placement preferences</div>
+    <label class="field"><span>College / university</span><input name="college" maxlength="160" placeholder="Your college or university"></label>
+    <label class="field"><span>Preferred role</span><input name="preferred_role" maxlength="120" placeholder="Software Engineer"></label>
+    <div class="auth-section-heading">Secure your account</div>
+    <label class="field"><span>Password</span><span class="password-control"><input name="password" type="password" minlength="8" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle data-show-label="Show password" data-hide-label="Hide password" aria-label="Show password" aria-pressed="false">Show</button></span><small>Use 8+ characters with uppercase, lowercase, a number, and a symbol.</small></label>
+    <label class="field"><span>Confirm password</span><span class="password-control"><input name="confirm_password" type="password" minlength="8" autocomplete="new-password" required><button type="button" class="password-toggle" data-password-toggle data-show-label="Show password" data-hide-label="Hide password" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+    <button class="btn-primary auth-submit" type="submit"><span class="auth-submit-label">Create account →</span><span class="auth-spinner" aria-hidden="true"></span></button>
+  </form>
+  <p class="auth-switch">Already registered? <a href="{{ url_for('web_login') }}">Sign in instead</a></p>
+</section>
+<script>
+  document.querySelector("[data-auth-form]")?.addEventListener("submit", event => {
+    const form = event.currentTarget;
+    if (form.dataset.submitting === "true") { event.preventDefault(); return; }
+    form.dataset.submitting = "true";
+    const button = form.querySelector(".auth-submit");
+    button.disabled = true;
+    button.classList.add("is-loading");
+  });
+</script>
+{% endblock %}

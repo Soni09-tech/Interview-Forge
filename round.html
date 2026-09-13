@@ -1,0 +1,50 @@
+{% extends "layout.html" %}
+{% block title %}Round {{ round_number }} · InterviewForge{% endblock %}
+{% block content %}
+<section class="panel">
+  <p class="kicker">Round {{ round_number }} · {{ selected.name }} at {{ selected.company }}</p>
+  <h1>{{ total }}-question assessment</h1>
+  <p>Campus-placement aptitude and analytical reasoning. Choose one answer for every question. You have {{ duration }} minutes; a score of 60% unlocks the next round.</p>
+  <form method="post" id="assessment-form">
+    <div id="question-progress" class="question-progress" aria-live="polite"></div>
+    {% for question in questions %}
+    <fieldset class="question paged-question">
+      <legend>{{ loop.index }}. {{ question.prompt }} <span class="difficulty-badge difficulty-{{ question.difficulty }}">{{ question.difficulty|capitalize }}</span></legend>
+      <small class="question-category">{{ question.category }}</small>
+      {% for option in question.options_json|from_json %}
+      <label class="option"><input type="radio" name="answer_{{ question.id }}" value="{{ option }}" required><span>{{ option }}</span></label>
+      {% endfor %}
+    </fieldset>
+    {% endfor %}
+    <div class="question-controls">
+      <button type="button" class="btn-secondary" id="previous-question">Previous</button>
+      <button type="button" class="btn-secondary" id="next-question">Next</button>
+      <button class="btn-primary" id="submit-round">Submit round →</button>
+    </div>
+  </form>
+</section>
+<script>
+(function () {
+  const items = [...document.querySelectorAll(".paged-question")];
+  const progress = document.getElementById("question-progress");
+  const previous = document.getElementById("previous-question");
+  const next = document.getElementById("next-question");
+  const submit = document.getElementById("submit-round");
+  let current = 0;
+  function render() {
+    items.forEach((item, index) => { item.hidden = index !== current; });
+    progress.textContent = `Question ${current + 1} of ${items.length}`;
+    previous.hidden = current === 0;
+    next.hidden = current === items.length - 1;
+    submit.hidden = current !== items.length - 1;
+  }
+  function move(delta) {
+    const target = current + delta;
+    if (target >= 0 && target < items.length) { current = target; render(); }
+  }
+  previous.addEventListener("click", () => move(-1));
+  next.addEventListener("click", () => move(1));
+  render();
+}());
+</script>
+{% endblock %}

@@ -1,0 +1,79 @@
+{% extends "layout.html" %}
+{% block title %}Sign in · InterviewForge{% endblock %}
+{% block content %}
+<section class="auth-card auth-gate">
+  <p class="kicker">Secure entry</p>
+  <h1>Sign in to InterviewForge</h1>
+  <p class="auth-lede">Continue your placement preparation, progress, and interview practice.</p>
+
+  {% if google_client_id %}
+  <div id="google-signin" class="google-signin" data-client-id="{{ google_client_id }}"></div>
+  <div class="auth-divider"><span>or continue with email</span></div>
+  {% endif %}
+
+  <form method="post" class="auth-form" data-auth-form>
+    <label class="field">
+      <span>Email address</span>
+      <input name="email" type="email" autocomplete="email" required autofocus>
+    </label>
+    <label class="field">
+      <span>Password</span>
+      <span class="password-control">
+        <input name="password" type="password" autocomplete="current-password" required>
+        <button type="button" class="password-toggle" data-password-toggle
+          data-show-label="Show password" data-hide-label="Hide password"
+          aria-label="Show password" aria-pressed="false">Show</button>
+      </span>
+    </label>
+    <button class="btn-primary auth-submit" type="submit">
+      <span class="auth-submit-label">Sign in →</span>
+      <span class="auth-spinner" aria-hidden="true"></span>
+    </button>
+  </form>
+  <p class="auth-switch">Don’t have an account? <a href="{{ url_for('web_register') }}">Sign up</a></p>
+</section>
+{% if google_client_id %}
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<script>
+  window.handleGoogleCredential = async function(response) {
+    const button = document.querySelector(".google-signin");
+    const form = document.querySelector("[data-auth-form]");
+    if (button) button.classList.add("is-loading");
+    if (form) form.querySelectorAll("input,button").forEach(control => control.disabled = true);
+    try {
+      const result = await fetch("{{ url_for('google_login') }}", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({credential: response.credential})
+      });
+      const payload = await result.json();
+      if (!result.ok) throw new Error(payload.error || "Google sign-in failed.");
+      window.location.assign(payload.redirect);
+    } catch (error) {
+      window.alert(error.message);
+      if (button) button.classList.remove("is-loading");
+      if (form) form.querySelectorAll("input,button").forEach(control => control.disabled = false);
+    }
+  };
+  window.addEventListener("load", () => {
+    google.accounts.id.initialize({
+      client_id: document.querySelector(".google-signin").dataset.clientId,
+      callback: window.handleGoogleCredential
+    });
+    google.accounts.id.renderButton(document.querySelector(".google-signin"), {
+      theme: "outline", size: "large", text: "continue_with", width: 360
+    });
+  });
+</script>
+{% endif %}
+<script>
+  document.querySelector("[data-auth-form]")?.addEventListener("submit", event => {
+    const form = event.currentTarget;
+    if (form.dataset.submitting === "true") { event.preventDefault(); return; }
+    form.dataset.submitting = "true";
+    const button = form.querySelector(".auth-submit");
+    button.disabled = true;
+    button.classList.add("is-loading");
+  });
+</script>
+{% endblock %}

@@ -1,0 +1,31 @@
+{% extends "layout.html" %}
+{% block title %}Placement journey · InterviewForge{% endblock %}
+{% block content %}
+<section>
+  <p class="kicker">Official assessment</p>
+  <h1>Placement journey</h1>
+  {% if selected %}
+  <p>Preparing for <strong>{{ selected.name }}</strong> at <strong>{{ selected.company }}</strong>. <a href="{{ url_for('select_role') }}">Change</a></p>
+  {% else %}
+  <p><a href="{{ url_for('select_role') }}">Select a role</a> to begin.</p>
+  {% endif %}
+  <div class="rounds">
+    <article class="round {% if unlocked >= 1 %}unlocked{% else %}locked{% endif %}">
+      <strong>Round 1</strong><span>Aptitude + reasoning · 20 questions · 20 minutes</span>
+      {% if unlocked >= 1 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=1) }}">Open round →</a><a class="btn-secondary" href="{{ url_for('round_page', round_number=1, retest=1) }}">Retest →</a>{% endif %}
+    </article>
+    <article class="round {% if unlocked >= 2 %}unlocked{% else %}locked{% endif %}">
+      <strong>Round 2</strong><span>Technical online test · 20 questions · 20 minutes</span>
+      {% if unlocked >= 2 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=2) }}">Open round →</a><a class="btn-secondary" href="{{ url_for('round_page', round_number=2, retest=1) }}">Retest →</a>{% else %}<span>Locked until Round 1 is passed</span>{% endif %}
+    </article>
+    <article class="round {% if unlocked >= 3 %}unlocked{% else %}locked{% endif %}">
+      <strong>Round 3</strong><span>HR interview · 5 questions · camera + microphone required</span>
+      {% if unlocked >= 3 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=3) }}">Open round →</a>{% else %}<span>Locked until Round 2 is passed</span>{% endif %}
+    </article>
+    <article class="round {% if unlocked >= 4 %}unlocked{% else %}locked{% endif %}">
+      <strong>Round 4</strong><span>Technical AI interview · 5–7 questions · camera + microphone required</span>
+      {% if unlocked >= 4 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=4) }}">Open round →</a>{% else %}<span>Locked until Round 3 is passed</span>{% endif %}
+    </article>
+  </div>
+</section>
+{% endblock %}

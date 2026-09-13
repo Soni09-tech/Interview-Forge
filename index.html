@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>!function(){const saved=localStorage.getItem("interviewforge-theme");const theme=saved||(("matchMedia" in window&&matchMedia("(prefers-color-scheme: light)").matches)?"light":"dark");document.documentElement.dataset.theme=theme}();</script>
+  <title>InterviewForge · AI interview practice</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <button class="theme-toggle spa-theme-toggle" type="button" data-theme-toggle aria-label="Switch to light theme" aria-pressed="false"><span class="theme-icon" aria-hidden="true">☀</span><span class="theme-label">Light</span></button>
+  <div id="auth-view" class="auth-view">
+    <div class="auth-card"><div class="brand"><span class="brand-mark">IF</span> Interview<span>Forge</span></div>
+      <h1>Prepare with confidence.</h1><p class="lede">Practice realistic interviews, track your progress, and turn feedback into your next opportunity.</p>
+      <div class="tabs"><button class="tab active" data-auth="login">Log in</button><button class="tab" data-auth="register">Create account</button></div>
+      <form id="auth-form"><label class="field"><span>Email</span><input id="email" type="email" required autocomplete="email"></label>
+        <label class="field" id="name-field" hidden><span>Your full name</span><input id="name" maxlength="80" autocomplete="name"></label>
+        <label class="field"><span>Password <small id="password-help">(8+ characters)</small></span><span class="password-control"><input id="password" type="password" required minlength="8" autocomplete="current-password"><button type="button" class="password-toggle" data-password-toggle data-show-label="Show password" data-hide-label="Hide password" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+        <label class="field" id="confirm-password-field" hidden><span>Confirm password</span><span class="password-control"><input id="confirm-password" type="password" minlength="8" autocomplete="new-password"><button type="button" class="password-toggle" data-password-toggle data-show-label="Show password" data-hide-label="Hide password" aria-label="Show password" aria-pressed="false">Show</button></span></label>
+        <button class="btn-primary" type="submit" id="auth-submit">Log in <span>→</span></button><p class="form-error" id="auth-error"></p>
+      </form>
+    </div>
+  </div>
+  <div id="app-view" hidden>
+    <aside class="sidebar"><div class="brand"><span class="brand-mark">IF</span> Interview<span>Forge</span></div>
+      <nav><button class="nav-item active" data-page="overview">◈ <span>Overview</span></button><button class="nav-item" data-page="practice">◎ <span>Practice Arena</span></button><button class="nav-item" data-page="official">◆ <span>Official rounds</span></button><button class="nav-item" data-page="profile">⚙ <span>Profile & resume</span></button></nav>
+      <button id="logout" class="nav-item logout">↪ <span>Log out</span></button>
+    </aside>
+    <main class="dashboard"><header class="dash-head"><div><p class="kicker">Your preparation hub</p><h1 id="page-title">Good to see you.</h1></div><div class="avatar" id="avatar">?</div></header>
+      <div id="flash" class="flash" hidden></div>
+      <section id="page-overview" class="page"><div class="stat-grid"><div class="stat-card"><small>XP earned</small><strong id="xp">0</strong><span>Keep showing up</span></div><div class="stat-card"><small>Current streak</small><strong id="streak">0 days</strong><span>Consistency wins</span></div><div class="stat-card"><small>Readiness</small><strong id="readiness">—</strong><span>Complete an official round</span></div></div>
+        <div class="panel"><div class="panel-head"><div><p class="kicker">Choose your next move</p><h2>Build interview muscle</h2></div><button class="btn-secondary" data-page-jump="practice">Start practicing →</button></div><p class="lede">Use Practice Arena to experiment freely, or follow locked official rounds to measure progress.</p></div>
+        <div class="panel"><div class="panel-head"><h2>How it works</h2></div><div class="steps"><div><b>01</b><strong>Pick a role</strong><span>Tailor your sessions to a real opportunity.</span></div><div><b>02</b><strong>Practice out loud</strong><span>Get structured, actionable AI feedback.</span></div><div><b>03</b><strong>Pass official rounds</strong><span>Unlock badges as your confidence grows.</span></div></div></div>
+      </section>
+      <section id="page-practice" class="page" hidden><div class="panel"><p class="kicker">No pressure</p><h2>Practice Arena</h2><p>Choose your role and target company separately. Questions work with or without an AI API key.</p><form id="practice-form" class="inline-form"><label class="field"><span>Job role</span><select id="practice-role" required></select></label><label class="field"><span>Target company</span><select id="practice-company" required></select></label><button class="btn-primary">Generate questions →</button></form><div id="practice-output"></div></div></section>
+      <section id="page-official" class="page" hidden><div class="panel"><p class="kicker">Placement journey</p><h2>Official rounds</h2><p>Pass each round to unlock the next one. Your results are saved to your account.</p><div class="rounds"><div class="round unlocked"><b>Round 1</b><span>Fundamentals · unlocked</span><button class="btn-secondary round-start" data-round="1">Start →</button></div><div class="round locked"><b>Round 2</b><span>Behavioral · locked until Round 1 pass</span></div><div class="round locked"><b>Round 3</b><span>Technical deep dive · locked until Round 2 pass</span></div><div class="round locked"><b>Round 4</b><span>Final placement simulation · locked until Round 3 pass</span></div></div></div></section>
+      <section id="page-profile" class="page" hidden><div class="panel"><p class="kicker">Your materials</p><h2>Profile & resume</h2><p id="profile-email"></p><form id="profile-form" class="profile-form"><label class="field"><span>College / university</span><input id="college" maxlength="160"></label><label class="field"><span>Graduation year</span><input id="graduation-year" type="number" min="1950" max="2100"></label><label class="field"><span>Preferred role</span><input id="preferred-role" maxlength="120"></label><label class="field"><span>Preferred company</span><input id="preferred-company" maxlength="120"></label><button class="btn-secondary">Save profile</button></form><form id="resume-form"><label class="upload-card"><strong>Upload a PDF resume</strong><small>Maximum 5 MB · text is extracted securely</small><input id="resume" type="file" accept="application/pdf" required></label><button class="btn-primary">Save resume & analyze →</button></form><div id="resume-result"></div></div></section>
+    </main>
+  </div>
+  <script>window.interviewForgeLoggedIn = {{ "true" if logged_in else "false" }};</script>
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body></html>
