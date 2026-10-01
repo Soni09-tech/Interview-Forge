@@ -15,11 +15,11 @@
       {% if unlocked >= 1 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=1) }}">Open round →</a><a class="btn-secondary" href="{{ url_for('round_page', round_number=1, retest=1) }}">Retest →</a>{% endif %}
     </article>
     <article class="round {% if unlocked >= 2 %}unlocked{% else %}locked{% endif %}">
-      <strong>Round 2</strong><span>Technical online test · 20 questions · 20 minutes</span>
+      <strong>Round 2</strong><span>Technical MCQs + coding task · 20 questions · sandbox-verified code</span>
       {% if unlocked >= 2 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=2) }}">Open round →</a><a class="btn-secondary" href="{{ url_for('round_page', round_number=2, retest=1) }}">Retest →</a>{% else %}<span>Locked until Round 1 is passed</span>{% endif %}
     </article>
     <article class="round {% if unlocked >= 3 %}unlocked{% else %}locked{% endif %}">
-      <strong>Round 3</strong><span>HR interview · 5 questions · camera + microphone required</span>
+      <strong>Round 3</strong><span>HR interview · 5 questions · optional voice or typed answers</span>
       {% if unlocked >= 3 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=3) }}">Open round →</a>{% else %}<span>Locked until Round 2 is passed</span>{% endif %}
     </article>
     <article class="round {% if unlocked >= 4 %}unlocked{% else %}locked{% endif %}">
@@ -27,5 +27,9 @@
       {% if unlocked >= 4 and selected %}<a class="btn-secondary" href="{{ url_for('round_page', round_number=4) }}">Open round →</a>{% else %}<span>Locked until Round 3 is passed</span>{% endif %}
     </article>
   </div>
+  <article class="panel coding-journey-card">
+    <div><p class="kicker">Additional practice</p><h2>Company-oriented coding lab</h2><p>Practice randomized C, C++, Java, JavaScript, and Python problems by company and difficulty. The official coding assessment is included in Round 2.</p></div>
+    <a class="btn-primary" href="{{ url_for('coding_round') }}">Open coding lab →</a>
+  </article>
 </section>
 {% endblock %}

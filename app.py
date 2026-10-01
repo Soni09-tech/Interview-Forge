@@ -6,22 +6,31 @@ is easy for a beginner to run and understand.  AI calls are kept behind
 """
 
 import json
+import hashlib
+import hmac
 import os
 import re
 import secrets
+import smtplib
+import ssl
 import sqlite3
 import random
+import time
 from datetime import date, timedelta
+from email.message import EmailMessage
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from anthropic import Anthropic
-from flask import Flask, g, jsonify, render_template, request, session, redirect, url_for, send_from_directory, flash
+from flask import Flask, abort, g, jsonify, render_template, request, session, redirect, url_for, send_from_directory, flash
 from google.auth.transport import requests as google_requests
 from google.oauth2 import id_token
 from pypdf import PdfReader
+import requests
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
+from coding_bank import CODING_QUESTIONS, LANGUAGES, STARTER_CODE
 
 BASE_DIR = Path(__file__).resolve().parent
 DATABASE = BASE_DIR / "interviewforge.sqlite3"
@@ -52,7 +61,22 @@ API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 client = Anthropic(api_key=API_KEY) if API_KEY else None
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+CODE_SANDBOX_URL = os.environ.get("CODE_SANDBOX_URL", "").strip().rstrip("/")
+CODE_SANDBOX_API_KEY = os.environ.get("CODE_SANDBOX_API_KEY", "")
 ROUND_QUESTION_COUNTS = {1: 20, 2: 20}
+LOGIN_ACCOUNT_FAILURE_LIMIT = 5
+LOGIN_IP_FAILURE_LIMIT = 20
+LOGIN_LOCK_SECONDS = 15 * 60
+LOGIN_WINDOW_SECONDS = 15 * 60
+OTP_LIFETIME_SECONDS = 10 * 60
+OTP_RESEND_COOLDOWN_SECONDS = 60
+OTP_REQUEST_LIMIT = 3
+OTP_REQUEST_WINDOW_SECONDS = 30 * 60
+OTP_VERIFY_LIMIT = 5
+PASSWORD_RESET_GRANT_SECONDS = 10 * 60
+SIGNUP_OTP_REQUEST_LIMIT = 3
+SIGNUP_OTP_REQUEST_WINDOW_SECONDS = 30 * 60
+SIGNUP_OTP_VERIFY_LIMIT = 5
 
 
 def get_db():
@@ -61,6 +85,23 @@ def get_db():
         g.db.row_factory = sqlite3.Row
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
+
+
+def _next_user_id(db):
+    maximum = db.execute("SELECT COALESCE(MAX(id), 0) FROM users").fetchone()[0]
+    tables = db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    for table_row in tables:
+        table_name = table_row[0]
+        quoted_table = '"' + table_name.replace('"', '""') + '"'
+        columns = db.execute(f"PRAGMA table_info({quoted_table})").fetchall()
+        if any(column[1] == "user_id" for column in columns):
+            value = db.execute(
+                f"SELECT COALESCE(MAX(user_id), 0) FROM {quoted_table}"
+            ).fetchone()[0]
+            maximum = max(maximum, value)
+    return maximum + 1
 
 
 @app.teardown_appcontext
@@ -76,7 +117,8 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
-          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, auth_version INTEGER NOT NULL DEFAULT 0,
+          email_verified INTEGER NOT NULL DEFAULT 1
         );
         CREATE TABLE IF NOT EXISTS profiles (
           user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -125,8 +167,29 @@ def init_db():
           difficulty TEXT NOT NULL DEFAULT 'medium', role_name TEXT NOT NULL DEFAULT '',
           source_type TEXT NOT NULL DEFAULT 'general'
         );
+        CREATE TABLE IF NOT EXISTS security_limits (
+          scope_key TEXT PRIMARY KEY, failures INTEGER NOT NULL DEFAULT 0,
+          window_started REAL NOT NULL, blocked_until REAL NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS password_reset_otps (
+          user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          otp_hash TEXT NOT NULL, expires_at REAL NOT NULL, sent_at REAL NOT NULL,
+          verify_attempts INTEGER NOT NULL DEFAULT 0, verified_until REAL,
+          reset_grant_hash TEXT
+        );
+        CREATE TABLE IF NOT EXISTS signup_verification_otps (
+          user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+          method TEXT NOT NULL, destination TEXT NOT NULL, otp_hash TEXT NOT NULL,
+          expires_at REAL NOT NULL, sent_at REAL NOT NULL,
+          verify_attempts INTEGER NOT NULL DEFAULT 0
+        );
         """
     )
+    user_columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
+    if "auth_version" not in user_columns:
+        db.execute("ALTER TABLE users ADD COLUMN auth_version INTEGER NOT NULL DEFAULT 0")
+    if "email_verified" not in user_columns:
+        db.execute("ALTER TABLE users ADD COLUMN email_verified INTEGER NOT NULL DEFAULT 1")
     # Keep the catalogue deterministic and useful even on a brand-new install.
     for name, description in [
         ("Google", "Technology, product, and data roles"),
@@ -515,7 +578,342 @@ def question_payload(row, number):
 
 def csrf_ok():
     token = session.get("csrf_token")
-    return bool(token and secrets.compare_digest(token, request.headers.get("X-CSRF-Token", "")))
+    submitted_token = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token", "")
+    return bool(token and secrets.compare_digest(token, submitted_token))
+
+
+def _secret_digest(purpose, value):
+    secret = app.config["SECRET_KEY"]
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    return hmac.new(secret, f"{purpose}:{value}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _limit_status(scope_key, now, window_seconds):
+    row = get_db().execute(
+        "SELECT failures, window_started, blocked_until FROM security_limits WHERE scope_key=?",
+        (scope_key,),
+    ).fetchone()
+    if not row:
+        return 0
+    if now - row["window_started"] >= window_seconds:
+        get_db().execute("DELETE FROM security_limits WHERE scope_key=?", (scope_key,))
+        return 0
+    return max(0, int(row["blocked_until"] - now))
+
+
+def _record_limit_failure(scope_key, now, window_seconds, failure_limit, lock_seconds):
+    db = get_db()
+    row = db.execute(
+        "SELECT failures, window_started, blocked_until FROM security_limits WHERE scope_key=?",
+        (scope_key,),
+    ).fetchone()
+    if not row or now - row["window_started"] >= window_seconds:
+        failures = 1
+        window_started = now
+        blocked_until = 0
+    else:
+        failures = row["failures"] + 1
+        window_started = row["window_started"]
+        blocked_until = row["blocked_until"]
+    if failures >= failure_limit:
+        blocked_until = max(blocked_until, now + lock_seconds)
+    db.execute(
+        """INSERT INTO security_limits(scope_key, failures, window_started, blocked_until)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(scope_key) DO UPDATE SET failures=excluded.failures,
+             window_started=excluded.window_started, blocked_until=excluded.blocked_until""",
+        (scope_key, failures, window_started, blocked_until),
+    )
+    return max(0, int(blocked_until - now))
+
+
+def _clear_limit(scope_key):
+    get_db().execute("DELETE FROM security_limits WHERE scope_key=?", (scope_key,))
+
+
+def _password_error(password, email="", name=""):
+    if not 8 <= len(password) <= 128:
+        return "Password must be 8–128 characters."
+    if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password):
+        return "Password must include uppercase and lowercase letters."
+    if not re.search(r"\d", password) or not re.search(r"[^A-Za-z0-9]", password):
+        return "Password must include a number and a special character."
+    email_name = email.split("@", 1)[0].lower()
+    if email_name and email_name in password.lower():
+        return "Password must not contain your email name."
+    if len(name) >= 3 and name.lower() in password.lower():
+        return "Password must not contain your name."
+    return None
+
+
+def _send_password_reset_otp(email, otp):
+    host = os.environ.get("SMTP_HOST", "").strip()
+    sender = os.environ.get("SMTP_FROM", "").strip()
+    if not host or not sender:
+        raise RuntimeError("Password reset email delivery is not configured.")
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise RuntimeError("SMTP_PORT must be a valid port number.") from exc
+    username = os.environ.get("SMTP_USERNAME", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+    use_ssl = os.environ.get("SMTP_USE_SSL", "0") == "1"
+    use_starttls = os.environ.get("SMTP_USE_STARTTLS", "1") == "1" and not use_ssl
+
+    message = EmailMessage()
+    message["Subject"] = "Your InterviewForge password reset code"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(
+        f"Your InterviewForge password reset code is {otp}.\n\n"
+        f"It expires in {OTP_LIFETIME_SECONDS // 60} minutes. If you did not request "
+        "this code, you can ignore this email."
+    )
+    context = ssl.create_default_context()
+    if use_ssl:
+        with smtplib.SMTP_SSL(host, port, timeout=10, context=context) as server:
+            if username:
+                server.login(username, password)
+            server.send_message(message)
+        return
+    with smtplib.SMTP(host, port, timeout=10) as server:
+        if use_starttls:
+            server.starttls(context=context)
+        if username:
+            server.login(username, password)
+        server.send_message(message)
+
+
+def _send_signup_email_otp(email, otp):
+    host = os.environ.get("SMTP_HOST", "").strip()
+    sender = os.environ.get("SMTP_FROM", "").strip()
+    if not host or not sender:
+        raise RuntimeError("Email verification is not configured.")
+    try:
+        port = int(os.environ.get("SMTP_PORT", "587"))
+    except ValueError as exc:
+        raise RuntimeError("SMTP_PORT must be a valid port number.") from exc
+    username = os.environ.get("SMTP_USERNAME", "")
+    password = os.environ.get("SMTP_PASSWORD", "")
+    use_ssl = os.environ.get("SMTP_USE_SSL", "0") == "1"
+    use_starttls = os.environ.get("SMTP_USE_STARTTLS", "1") == "1" and not use_ssl
+    message = EmailMessage()
+    message["Subject"] = "Verify your InterviewForge account"
+    message["From"] = sender
+    message["To"] = email
+    message.set_content(
+        f"Your InterviewForge verification code is {otp}.\n\n"
+        f"It expires in {OTP_LIFETIME_SECONDS // 60} minutes. "
+        "If you did not create an account, you can ignore this email."
+    )
+    context = ssl.create_default_context()
+    if use_ssl:
+        with smtplib.SMTP_SSL(host, port, timeout=10, context=context) as server:
+            if username:
+                server.login(username, password)
+            server.send_message(message)
+        return
+    with smtplib.SMTP(host, port, timeout=10) as server:
+        if use_starttls:
+            server.starttls(context=context)
+        if username:
+            server.login(username, password)
+        server.send_message(message)
+
+
+def _send_signup_sms_otp(phone, otp):
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "")
+    sender = os.environ.get("TWILIO_FROM_NUMBER", "").strip()
+    if not account_sid or not auth_token or not sender:
+        raise RuntimeError("Mobile verification is not configured.")
+    response = requests.post(
+        f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+        auth=(account_sid, auth_token),
+        data={
+            "From": sender,
+            "To": phone,
+            "Body": (
+                f"Your InterviewForge verification code is {otp}. "
+                f"It expires in {OTP_LIFETIME_SECONDS // 60} minutes."
+            ),
+        },
+        timeout=(3, 10),
+        allow_redirects=False,
+    )
+    if response.status_code < 200 or response.status_code >= 300:
+        raise RuntimeError("The configured mobile verification service rejected the request.")
+
+
+def _send_signup_otp(method, destination, otp):
+    if method == "email":
+        _send_signup_email_otp(destination, otp)
+    elif method == "sms":
+        _send_signup_sms_otp(destination, otp)
+    else:
+        raise ValueError("Choose email or mobile verification.")
+
+
+def _issue_signup_otp(user_id, method, destination, now):
+    db = get_db()
+    current = db.execute(
+        "SELECT sent_at FROM signup_verification_otps WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if current and now - current["sent_at"] < OTP_RESEND_COOLDOWN_SECONDS:
+        return "cooldown"
+
+    contact_key = _secret_digest(f"signup-otp-contact-{method}", destination.lower())
+    ip_key = _secret_digest("signup-otp-ip", request.remote_addr or "unknown")
+    contact_wait = _limit_status(contact_key, now, SIGNUP_OTP_REQUEST_WINDOW_SECONDS)
+    ip_wait = _limit_status(ip_key, now, SIGNUP_OTP_REQUEST_WINDOW_SECONDS)
+    if contact_wait or ip_wait:
+        return "rate_limited"
+    _record_limit_failure(
+        contact_key, now, SIGNUP_OTP_REQUEST_WINDOW_SECONDS,
+        SIGNUP_OTP_REQUEST_LIMIT, SIGNUP_OTP_REQUEST_WINDOW_SECONDS,
+    )
+    _record_limit_failure(
+        ip_key, now, SIGNUP_OTP_REQUEST_WINDOW_SECONDS, 10,
+        SIGNUP_OTP_REQUEST_WINDOW_SECONDS,
+    )
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    db.execute(
+        """INSERT INTO signup_verification_otps
+           (user_id, method, destination, otp_hash, expires_at, sent_at, verify_attempts)
+           VALUES (?, ?, ?, ?, ?, ?, 0)
+           ON CONFLICT(user_id) DO UPDATE SET method=excluded.method,
+             destination=excluded.destination, otp_hash=excluded.otp_hash,
+             expires_at=excluded.expires_at, sent_at=excluded.sent_at,
+             verify_attempts=0""",
+        (
+            user_id, method, destination,
+            _secret_digest(f"signup-verification-{user_id}-{method}", otp),
+            now + OTP_LIFETIME_SECONDS, now,
+        ),
+    )
+    db.commit()
+    try:
+        _send_signup_otp(method, destination, otp)
+    except (OSError, RuntimeError, ValueError, smtplib.SMTPException, requests.RequestException):
+        app.logger.warning("Signup verification delivery failed.")
+        return "delivery_failed"
+    return "sent"
+
+
+def _normalize_phone(phone):
+    value = re.sub(r"[^\d+]", "", phone.strip())
+    if value.count("+") > 1 or ("+" in value and not value.startswith("+")):
+        raise ValueError("Enter a valid phone number.")
+    digits = re.sub(r"\D", "", value)
+    if not 8 <= len(digits) <= 15:
+        raise ValueError("Enter a phone number with 8–15 digits.")
+    return f"+{digits}" if value.startswith("+") else digits
+
+
+def _phone_exists(db, phone):
+    canonical = re.sub(r"\D", "", phone)
+    if not canonical:
+        return False
+    for row in db.execute("SELECT phone FROM profiles WHERE phone <> ''").fetchall():
+        if re.sub(r"\D", "", row["phone"]) == canonical:
+            return True
+    return False
+
+
+def _masked_destination(method, destination):
+    if method == "email":
+        local, _, domain = destination.partition("@")
+        return f"{local[:1]}{'*' * max(1, min(len(local) - 1, 8))}@{domain}"
+    digits = re.sub(r"\D", "", destination)
+    return f"{'+' if destination.startswith('+') else ''}{'*' * max(0, len(digits) - 4)}{digits[-4:]}"
+
+
+def _issue_reset_otp(user_id, email, now):
+    db = get_db()
+    db.execute("DELETE FROM password_reset_otps WHERE expires_at<=?", (now,))
+    current = db.execute(
+        "SELECT sent_at FROM password_reset_otps WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    if current and now - current["sent_at"] < OTP_RESEND_COOLDOWN_SECONDS:
+        return "cooldown"
+
+    otp = f"{secrets.randbelow(1_000_000):06d}"
+    db.execute(
+        """INSERT INTO password_reset_otps
+           (user_id, otp_hash, expires_at, sent_at, verify_attempts, verified_until, reset_grant_hash)
+           VALUES (?, ?, ?, ?, 0, NULL, NULL)
+           ON CONFLICT(user_id) DO UPDATE SET otp_hash=excluded.otp_hash,
+             expires_at=excluded.expires_at, sent_at=excluded.sent_at,
+             verify_attempts=0, verified_until=NULL, reset_grant_hash=NULL""",
+        (user_id, _secret_digest(f"password-reset-otp-{user_id}", otp), now + OTP_LIFETIME_SECONDS, now),
+    )
+    db.commit()
+    try:
+        _send_password_reset_otp(email, otp)
+    except (OSError, RuntimeError, ValueError, smtplib.SMTPException):
+        app.logger.exception("Password reset email delivery failed.")
+        db.execute("DELETE FROM password_reset_otps WHERE user_id=?", (user_id,))
+        db.commit()
+        return "delivery_failed"
+    return "sent"
+
+
+def _set_authenticated_session(user):
+    session.clear()
+    session["user_id"] = user["id"]
+    session["auth_version"] = user["auth_version"] if "auth_version" in user.keys() else 0
+    session["csrf_token"] = secrets.token_urlsafe(32)
+
+
+DUMMY_PASSWORD_HASH = generate_password_hash(secrets.token_urlsafe(32))
+
+
+def _authenticate_login(email, password):
+    db = get_db()
+    now = time.time()
+    ip_key = _secret_digest("login-ip", request.remote_addr or "unknown")
+    ip_wait = _limit_status(ip_key, now, LOGIN_WINDOW_SECONDS)
+    if ip_wait:
+        return None, ip_wait, "ip"
+    user = db.execute(
+        "SELECT id, email, password_hash, auth_version, email_verified FROM users WHERE email=?",
+        (email if len(email) <= 254 else "",),
+    ).fetchone()
+    account_key = _secret_digest("login-account", str(user["id"])) if user else None
+    account_wait = _limit_status(account_key, now, LOGIN_WINDOW_SECONDS) if account_key else 0
+    if account_wait:
+        db.commit()
+        return None, account_wait, "account"
+
+    password_matches = check_password_hash(
+        user["password_hash"] if user else DUMMY_PASSWORD_HASH,
+        password if len(password) <= 128 else secrets.token_urlsafe(16),
+    )
+    if not user or not password_matches:
+        ip_wait = _record_limit_failure(
+            ip_key, now, LOGIN_WINDOW_SECONDS, LOGIN_IP_FAILURE_LIMIT, LOGIN_LOCK_SECONDS
+        )
+        account_wait = 0
+        if account_key:
+            account_wait = _record_limit_failure(
+                account_key, now, LOGIN_WINDOW_SECONDS,
+                LOGIN_ACCOUNT_FAILURE_LIMIT, LOGIN_LOCK_SECONDS,
+            )
+        db.commit()
+        wait = max(ip_wait, account_wait)
+        return None, wait, "account" if account_wait else "ip" if ip_wait else "invalid"
+
+    _clear_limit(ip_key)
+    if account_key:
+        _clear_limit(account_key)
+    db.commit()
+    if not user["email_verified"]:
+        return user, 0, "unverified"
+    return user, 0, None
 
 
 def login_required(view):
@@ -530,8 +928,37 @@ def login_required(view):
 @app.before_request
 def require_authentication():
     """Make the login page the only public application surface."""
-    public_paths = {"/", "/login", "/register", "/logout", "/api/auth/google"}
+    public_paths = {
+        "/", "/login", "/register", "/verify-signup", "/logout", "/forgot-password",
+        "/api/login", "/api/register", "/api/auth/google",
+    }
     if request.path in public_paths or request.path.startswith("/static/"):
+        if request.path.startswith("/static/") or not session.get("user_id"):
+            return None
+    if session.get("user_id"):
+        user = get_db().execute(
+            "SELECT auth_version, email_verified FROM users WHERE id=?",
+            (session["user_id"],),
+        ).fetchone()
+        if not user:
+            session.clear()
+        elif not user["email_verified"]:
+            user_id = session["user_id"]
+            session.clear()
+            session["signup_verification_user_id"] = user_id
+            session["signup_verification_method"] = "email"
+            session["signup_csrf_token"] = secrets.token_urlsafe(32)
+            if request.path.startswith("/api/"):
+                return json_error("Verify your email address before continuing.", 403)
+            return redirect(url_for("verify_signup"))
+        elif "auth_version" not in session:
+            session["auth_version"] = user["auth_version"]
+        elif session["auth_version"] != user["auth_version"]:
+            session.clear()
+            if request.path.startswith("/api/"):
+                return json_error("Your session has expired. Please log in again.", 401)
+            return redirect(url_for("web_login"))
+    if request.path in public_paths:
         return None
     if not session.get("user_id"):
         if request.path.startswith("/api/"):
@@ -630,63 +1057,572 @@ def static_files(filename):
     return send_from_directory(BASE_DIR, filename)
 
 
+def safe_next_url(target):
+    if not target:
+        return url_for("dashboard")
+    parsed = urlsplit(target)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or "\\" in target
+        or target.startswith("//")
+        or not parsed.path.startswith("/")
+    ):
+        return url_for("dashboard")
+    return target
+
+
+def _create_signup_account(data):
+    email = str(data.get("email", "")).strip().lower()
+    password = str(data.get("password", ""))
+    confirm_password = str(data.get("confirm_password", ""))
+    name = str(data.get("name", "")).strip()
+    phone_value = str(data.get("phone", "")).strip()
+    method = str(data.get("verification_method", "email")).strip().lower()
+    if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        raise ValueError("Enter a valid email address.")
+    if not 2 <= len(name) <= 80:
+        raise ValueError("Enter your full name (2–80 characters).")
+    if method not in {"email", "sms"}:
+        raise ValueError("Choose email or mobile verification.")
+    phone = _normalize_phone(phone_value) if phone_value else ""
+    if method == "sms":
+        if not phone:
+            raise ValueError("Enter your mobile number to verify by text message.")
+        if not phone.startswith("+"):
+            raise ValueError("Use the international format, including + and country code, for SMS verification.")
+    password_error = _password_error(password, email, name)
+    if password_error:
+        raise ValueError(password_error)
+    if password != confirm_password:
+        raise ValueError("Passwords do not match.")
+    graduation_year_value = data.get("graduation_year", "")
+    graduation_year = int(graduation_year_value) if graduation_year_value else None
+    if graduation_year is not None and not 1950 <= graduation_year <= 2100:
+        raise ValueError("Graduation year must be between 1950 and 2100.")
+
+    db = get_db()
+    db.execute("BEGIN IMMEDIATE")
+    if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+        db.rollback()
+        return None, "duplicate_email"
+    if phone and _phone_exists(db, phone):
+        db.rollback()
+        return None, "duplicate_phone"
+
+    uid = _next_user_id(db)
+    db.execute(
+        "INSERT INTO users(id,email,password_hash,email_verified) VALUES (?,?,?,0)",
+        (uid, email, generate_password_hash(password)),
+    )
+    db.execute(
+        """INSERT INTO profiles
+           (user_id,display_name,phone,college,graduation_year,preferred_role)
+           VALUES (?,?,?,?,?,?)""",
+        (
+            uid,
+            name,
+            phone,
+            str(data.get("college", "")).strip()[:160],
+            graduation_year,
+            str(data.get("preferred_role", "")).strip()[:120],
+        ),
+    )
+    db.execute("INSERT INTO streaks(user_id) VALUES (?)", (uid,))
+    db.commit()
+    delivery = _issue_signup_otp(
+        uid,
+        method,
+        email if method == "email" else phone,
+        time.time(),
+    )
+    return (uid, delivery, method)
+
+
 @app.route("/login", methods=["GET", "POST"])
 def web_login():
     if session.get("user_id"):
         return redirect(url_for("dashboard"))
     if request.method == "POST":
         email = request.form.get("email", "").strip().lower()
-        user = get_db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-        if not user or not check_password_hash(user["password_hash"], request.form.get("password", "")):
+        password = request.form.get("password", "")
+        user, retry_after, reason = _authenticate_login(email, password)
+        if retry_after:
+            minutes = max(1, (retry_after + 59) // 60)
+            flash(f"Too many unsuccessful attempts. Please try again in about {minutes} minute(s).", "error")
+        elif reason == "unverified" and user:
+            challenge = get_db().execute(
+                "SELECT method FROM signup_verification_otps WHERE user_id=?",
+                (user["id"],),
+            ).fetchone()
+            method = challenge["method"] if challenge else "email"
+            session["signup_verification_user_id"] = user["id"]
+            session["signup_verification_method"] = method
+            session.setdefault("signup_csrf_token", secrets.token_urlsafe(32))
+            flash(
+                f"Verify your {('email address' if method == 'email' else 'mobile number')} before signing in.",
+                "error",
+            )
+            return redirect(url_for("verify_signup"))
+        elif not user:
             flash("Email or password is incorrect.", "error")
         else:
-            session.clear()
-            session["user_id"] = user["id"]
-            session["csrf_token"] = secrets.token_urlsafe(32)
-            return redirect(request.args.get("next") or url_for("dashboard"))
+            _set_authenticated_session(user)
+            return redirect(safe_next_url(request.args.get("next")))
     return render_template("login.html", google_client_id=GOOGLE_CLIENT_ID)
+
+
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    session.setdefault("password_reset_csrf", secrets.token_urlsafe(32))
+    flow = session.get("password_reset_flow", {})
+    if request.method == "POST":
+        submitted_csrf = request.form.get("csrf_token", "")
+        expected_csrf = session.get("password_reset_csrf", "")
+        if not expected_csrf or not secrets.compare_digest(submitted_csrf, expected_csrf):
+            abort(403)
+
+        action = request.form.get("action", "")
+        now = time.time()
+        db = get_db()
+        ip_address = request.remote_addr or "unknown"
+
+        if action in {"request", "resend"}:
+            if action == "request":
+                email = request.form.get("email", "").strip().lower()
+            else:
+                reset_flow = session.get("password_reset_flow", {})
+                user_id = reset_flow.get("user_id")
+                if not user_id:
+                    flash(
+                        "If an account matches that address, a verification code has been sent. Check your inbox and spam folder.",
+                        "success",
+                    )
+                    return redirect(url_for("forgot_password"))
+                user = db.execute(
+                    "SELECT id, email FROM users WHERE id=?",
+                    (user_id,),
+                ).fetchone() if user_id else None
+                email = user["email"] if user else ""
+            if len(email) > 254 or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+                flash("Enter a valid email address.", "error")
+                return redirect(url_for("forgot_password"))
+
+            email_limit_key = _secret_digest("otp-send-email", email)
+            ip_limit_key = _secret_digest("otp-send-ip", ip_address)
+            email_wait = _limit_status(email_limit_key, now, OTP_REQUEST_WINDOW_SECONDS)
+            ip_wait = _limit_status(ip_limit_key, now, OTP_REQUEST_WINDOW_SECONDS)
+            if email_wait or ip_wait:
+                wait = max(email_wait, ip_wait)
+                flash(
+                    f"Too many code requests. Please wait about {max(1, (wait + 59) // 60)} minute(s) before trying again.",
+                    "error",
+                )
+                return redirect(url_for("forgot_password"))
+            _record_limit_failure(
+                email_limit_key, now, OTP_REQUEST_WINDOW_SECONDS,
+                OTP_REQUEST_LIMIT, OTP_REQUEST_WINDOW_SECONDS,
+            )
+            _record_limit_failure(
+                ip_limit_key, now, OTP_REQUEST_WINDOW_SECONDS, 10,
+                OTP_REQUEST_WINDOW_SECONDS,
+            )
+            db.commit()
+
+            if action == "request":
+                user = db.execute(
+                    "SELECT id, email FROM users WHERE email=?",
+                    (email,),
+                ).fetchone()
+            else:
+                user = db.execute(
+                    "SELECT id, email FROM users WHERE id=?",
+                    (session.get("password_reset_flow", {}).get("user_id"),),
+                ).fetchone() if session.get("password_reset_flow", {}).get("user_id") else None
+
+            if user:
+                issue_result = _issue_reset_otp(user["id"], user["email"], now)
+                if issue_result == "delivery_failed":
+                    app.logger.warning("Password reset OTP could not be delivered.")
+                elif issue_result == "cooldown":
+                    flash(
+                        "If an account matches that address, a code was sent recently. Wait a minute before requesting another.",
+                        "success",
+                    )
+                    return redirect(url_for("forgot_password"))
+                session["password_reset_flow"] = {
+                    "user_id": user["id"],
+                    "step": "verify",
+                }
+            elif action == "request":
+                session["password_reset_flow"] = {"user_id": None, "step": "verify"}
+
+            flash(
+                "If an account matches that address, a verification code has been sent. Check your inbox and spam folder.",
+                "success",
+            )
+            return redirect(url_for("forgot_password"))
+
+        reset_flow = session.get("password_reset_flow", {})
+        user_id = reset_flow.get("user_id")
+        if action == "verify":
+            if reset_flow.get("step") != "verify":
+                flash("Request a password reset code first.", "error")
+                return redirect(url_for("forgot_password"))
+            scope_identity = str(user_id) if user_id else _secret_digest("unknown-reset-ip", ip_address)
+            verify_limit_key = _secret_digest("otp-verify", scope_identity)
+            verify_wait = _limit_status(verify_limit_key, now, OTP_LIFETIME_SECONDS)
+            if verify_wait:
+                flash(
+                    f"Too many incorrect codes. Please wait about {max(1, (verify_wait + 59) // 60)} minute(s).",
+                    "error",
+                )
+                return redirect(url_for("forgot_password"))
+            otp_row = db.execute(
+                "SELECT * FROM password_reset_otps WHERE user_id=?",
+                (user_id,),
+            ).fetchone() if user_id else None
+            otp = request.form.get("otp", "").strip()
+            expected_hash = _secret_digest(f"password-reset-otp-{user_id}", otp) if user_id else ""
+            if not otp_row or otp_row["expires_at"] <= now:
+                if otp_row:
+                    db.execute("DELETE FROM password_reset_otps WHERE user_id=?", (user_id,))
+                    db.commit()
+                flash("That code is invalid or expired. Request a new one to continue.", "error")
+                session.pop("password_reset_flow", None)
+                return redirect(url_for("forgot_password"))
+            if (
+                otp_row["verify_attempts"] >= OTP_VERIFY_LIMIT
+                or not re.fullmatch(r"\d{6}", otp)
+                or not secrets.compare_digest(otp_row["otp_hash"], expected_hash)
+            ):
+                wait = _record_limit_failure(
+                    verify_limit_key, now, OTP_LIFETIME_SECONDS,
+                    OTP_VERIFY_LIMIT, OTP_LIFETIME_SECONDS,
+                )
+                db.execute(
+                    "UPDATE password_reset_otps SET verify_attempts=verify_attempts+1 WHERE user_id=?",
+                    (user_id,),
+                )
+                db.commit()
+                if wait:
+                    flash("Too many incorrect codes. Request another code after the cooldown.", "error")
+                else:
+                    flash("That code is not correct. Check it and try again.", "error")
+                return redirect(url_for("forgot_password"))
+
+            grant = secrets.token_urlsafe(32)
+            verified_until = now + PASSWORD_RESET_GRANT_SECONDS
+            db.execute(
+                "UPDATE password_reset_otps SET verified_until=?, reset_grant_hash=? WHERE user_id=?",
+                (verified_until, _secret_digest(f"password-reset-grant-{user_id}", grant), user_id),
+            )
+            db.commit()
+            _clear_limit(verify_limit_key)
+            db.commit()
+            session["password_reset_flow"] = {
+                "user_id": user_id,
+                "step": "reset",
+                "grant": grant,
+            }
+            flash("Code verified. Choose a new password.", "success")
+            return redirect(url_for("forgot_password"))
+
+        if action == "reset":
+            if reset_flow.get("step") != "reset" or not user_id or not reset_flow.get("grant"):
+                flash("Verify a reset code before choosing a new password.", "error")
+                return redirect(url_for("forgot_password"))
+            password = request.form.get("password", "")
+            confirm_password = request.form.get("confirm_password", "")
+            password_error = _password_error(password)
+            if password_error:
+                flash(password_error, "error")
+                return render_template(
+                    "forgot_password.html",
+                    step="reset",
+                    csrf_token=session["password_reset_csrf"],
+                )
+            if password != confirm_password:
+                flash("Passwords do not match.", "error")
+                return render_template(
+                    "forgot_password.html",
+                    step="reset",
+                    csrf_token=session["password_reset_csrf"],
+                )
+
+            db.execute("BEGIN IMMEDIATE")
+            user = db.execute(
+                "SELECT id, email, auth_version FROM users WHERE id=?",
+                (user_id,),
+            ).fetchone()
+            otp_row = db.execute(
+                "SELECT * FROM password_reset_otps WHERE user_id=?",
+                (user_id,),
+            ).fetchone()
+            now = time.time()
+            password_error = _password_error(password, user["email"]) if user else None
+            if password_error:
+                db.rollback()
+                flash(password_error, "error")
+                return render_template(
+                    "forgot_password.html",
+                    step="reset",
+                    csrf_token=session["password_reset_csrf"],
+                )
+            if (
+                not user
+                or not otp_row
+                or not otp_row["verified_until"]
+                or otp_row["verified_until"] <= now
+                or not otp_row["reset_grant_hash"]
+                or not secrets.compare_digest(
+                    otp_row["reset_grant_hash"],
+                    _secret_digest(f"password-reset-grant-{user_id}", reset_flow["grant"]),
+                )
+            ):
+                db.rollback()
+                session.pop("password_reset_flow", None)
+                flash("Your reset verification has expired. Request a new code.", "error")
+                return redirect(url_for("forgot_password"))
+            db.execute(
+                "UPDATE users SET password_hash=?, auth_version=auth_version+1 WHERE id=?",
+                (generate_password_hash(password), user_id),
+            )
+            consumed = db.execute(
+                """DELETE FROM password_reset_otps
+                   WHERE user_id=? AND reset_grant_hash=? AND verified_until>?""",
+                (
+                    user_id,
+                    otp_row["reset_grant_hash"],
+                    now,
+                ),
+            )
+            if consumed.rowcount != 1:
+                db.rollback()
+                session.pop("password_reset_flow", None)
+                flash("Your reset verification has expired. Request a new code.", "error")
+                return redirect(url_for("forgot_password"))
+            _clear_limit(_secret_digest("login-account", str(user_id)))
+            db.commit()
+            session.clear()
+            flash("Your password has been updated. Please sign in with your new password.", "success")
+            return redirect(url_for("web_login"))
+
+        flash("Choose a valid password reset step.", "error")
+        return redirect(url_for("forgot_password"))
+
+    step = flow.get("step", "request")
+    if step in {"verify", "reset"}:
+        user_id = flow.get("user_id")
+        row = get_db().execute(
+            "SELECT expires_at, verified_until FROM password_reset_otps WHERE user_id=?",
+            (user_id,),
+        ).fetchone() if user_id else None
+        expired = (
+            not row
+            or row["expires_at"] <= time.time()
+            or (step == "reset" and (
+                not row["verified_until"] or row["verified_until"] <= time.time()
+            ))
+        )
+        if expired:
+            session.pop("password_reset_flow", None)
+            step = "request"
+            flash("Your reset code or verification has expired. Request a new code.", "error")
+    return render_template(
+        "forgot_password.html",
+        step=step,
+        csrf_token=session["password_reset_csrf"],
+    )
 
 
 @app.route("/register", methods=["GET", "POST"])
 def web_register():
+    if session.get("user_id"):
+        return redirect(url_for("dashboard"))
+    session.setdefault("signup_csrf_token", secrets.token_urlsafe(32))
     if request.method == "POST":
-        data = {key: request.form.get(key, "") for key in (
-            "email", "password", "confirm_password", "name", "phone", "college", "graduation_year", "preferred_role"
-        )}
+        submitted_csrf = request.form.get("csrf_token", "")
+        if not secrets.compare_digest(session["signup_csrf_token"], submitted_csrf):
+            abort(403)
         try:
-            email, password, name = data["email"].strip().lower(), data["password"], data["name"].strip()[:80]
-            if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not name:
-                raise ValueError("Enter a valid email address and your full name.")
-            phone = re.sub(r"[^\d+()\-\s]", "", data["phone"]).strip()[:30]
-            college = data["college"].strip()[:160]
-            preferred_role = data["preferred_role"].strip()[:120]
-            graduation_year = int(data["graduation_year"]) if data["graduation_year"] else None
-            if graduation_year is not None and not 1950 <= graduation_year <= 2100:
-                raise ValueError("Graduation year must be between 1950 and 2100.")
-            if len(password) < 8 or len(password) > 128 or not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password) or not re.search(r"\d", password) or not re.search(r"[^A-Za-z0-9]", password):
-                raise ValueError("Password must be 8–128 characters with uppercase, lowercase, number, and symbol.")
-            if password != data["confirm_password"]:
-                raise ValueError("Passwords do not match.")
-            if email.split("@")[0] in password.lower() or (len(name) >= 3 and name.lower() in password.lower()):
-                raise ValueError("Password must not contain your email name or full name.")
-            db = get_db()
-            uid = db.execute("INSERT INTO users(email,password_hash) VALUES (?,?)", (email, generate_password_hash(password))).lastrowid
-            db.execute(
-                "INSERT INTO profiles(user_id,display_name,phone,college,graduation_year,preferred_role) VALUES (?,?,?,?,?,?)",
-                (uid, name, phone, college, graduation_year, preferred_role),
-            )
-            db.execute("INSERT INTO streaks(user_id) VALUES (?)", (uid,))
-            db.commit()
-            flash("Account created successfully. Please log in.", "success")
-            return redirect(url_for("web_login"))
-        except sqlite3.IntegrityError:
-            flash("An account with that email already exists.", "error")
+            created = _create_signup_account(request.form.to_dict())
+            if created[0] is None:
+                if created[1] == "duplicate_email":
+                    flash("An account with that email already exists.", "error")
+                else:
+                    flash("That phone number is already linked to an account.", "error")
+            else:
+                user_id, delivery, method = created
+                session["signup_verification_user_id"] = user_id
+                session["signup_verification_method"] = method
+                if delivery == "sent":
+                    flash(
+                        f"Account created. Enter the code sent by {method_label(method)} to verify it before signing in.",
+                        "success",
+                    )
+                elif delivery == "cooldown":
+                    flash("A verification code was sent recently. Wait a minute before requesting another.", "error")
+                elif delivery == "rate_limited":
+                    flash("Too many verification code requests. Please wait before trying again.", "error")
+                else:
+                    flash(
+                        f"Your account is not active yet. We could not send the {method_label(method)} code; use resend after the cooldown.",
+                        "error",
+                    )
+                return redirect(url_for("verify_signup"))
         except ValueError as exc:
             flash(str(exc), "error")
-    return render_template("register.html")
+    return render_template(
+        "register.html",
+        signup_csrf_token=session["signup_csrf_token"],
+    )
 
 
-@app.get("/logout")
+def method_label(method):
+    return "email" if method == "email" else "text message"
+
+
+@app.route("/verify-signup", methods=["GET", "POST"])
+def verify_signup():
+    user_id = session.get("signup_verification_user_id")
+    if not user_id:
+        flash("Start by creating an account or signing in.", "error")
+        return redirect(url_for("web_register"))
+    session.setdefault("signup_csrf_token", secrets.token_urlsafe(32))
+    db = get_db()
+    user = db.execute(
+        """SELECT u.id, u.email, u.email_verified, p.phone
+           FROM users u LEFT JOIN profiles p ON p.user_id=u.id WHERE u.id=?""",
+        (user_id,),
+    ).fetchone()
+    if not user:
+        session.pop("signup_verification_user_id", None)
+        session.pop("signup_verification_method", None)
+        flash("That signup could not be found. Please register again.", "error")
+        return redirect(url_for("web_register"))
+    if user["email_verified"]:
+        session.pop("signup_verification_user_id", None)
+        session.pop("signup_verification_method", None)
+        flash("This account is already verified. You can sign in.", "success")
+        return redirect(url_for("web_login"))
+
+    now = time.time()
+    otp_row = db.execute(
+        "SELECT * FROM signup_verification_otps WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    method = (
+        otp_row["method"] if otp_row
+        else session.get("signup_verification_method", "email")
+    )
+    destination = (
+        otp_row["destination"] if otp_row
+        else user["email"] if method == "email"
+        else user["phone"] or ""
+    )
+    resend_wait = (
+        max(0, OTP_RESEND_COOLDOWN_SECONDS - int(now - otp_row["sent_at"]))
+        if otp_row else 0
+    )
+    code_expired = bool(otp_row and otp_row["expires_at"] <= now)
+    if request.method == "POST":
+        if not secrets.compare_digest(
+            session["signup_csrf_token"],
+            request.form.get("csrf_token", ""),
+        ):
+            abort(403)
+        action = request.form.get("action", "")
+        if action == "resend":
+            result = _issue_signup_otp(user_id, method, destination, now)
+            if result == "sent":
+                flash(f"A new code was sent by {method_label(method)}.", "success")
+            elif result == "cooldown":
+                flash("Please wait 60 seconds before requesting another code.", "error")
+            elif result == "rate_limited":
+                flash("Too many code requests. Please wait before trying again.", "error")
+            else:
+                flash(
+                    f"We could not send a code by {method_label(method)}. Check the service configuration and try again later.",
+                    "error",
+                )
+            return redirect(url_for("verify_signup"))
+        if action != "verify":
+            flash("Choose a valid verification action.", "error")
+            return redirect(url_for("verify_signup"))
+        if not otp_row:
+            flash("No active verification code was found. Request a new code.", "error")
+            return redirect(url_for("verify_signup"))
+        if otp_row["expires_at"] <= now:
+            flash("That code has expired. Request a new one to continue.", "error")
+            return redirect(url_for("verify_signup"))
+        if otp_row["verify_attempts"] >= SIGNUP_OTP_VERIFY_LIMIT:
+            flash("Too many incorrect codes. Wait for the resend cooldown, then request a new code.", "error")
+            return redirect(url_for("verify_signup"))
+
+        otp = request.form.get("otp", "").strip()
+        expected_hash = _secret_digest(
+            f"signup-verification-{user_id}-{method}",
+            otp,
+        )
+        if not re.fullmatch(r"\d{6}", otp) or not secrets.compare_digest(
+            otp_row["otp_hash"],
+            expected_hash,
+        ):
+            db.execute(
+                """UPDATE signup_verification_otps
+                   SET verify_attempts=verify_attempts+1 WHERE user_id=?""",
+                (user_id,),
+            )
+            db.commit()
+            attempts_left = max(0, SIGNUP_OTP_VERIFY_LIMIT - otp_row["verify_attempts"] - 1)
+            if attempts_left:
+                flash(f"That code is incorrect. {attempts_left} attempt(s) remaining.", "error")
+            else:
+                flash("Too many incorrect codes. Request a new code after the resend cooldown.", "error")
+            return redirect(url_for("verify_signup"))
+
+        db.execute("BEGIN IMMEDIATE")
+        current = db.execute(
+            """SELECT otp_hash, expires_at, verify_attempts, method
+               FROM signup_verification_otps WHERE user_id=?""",
+            (user_id,),
+        ).fetchone()
+        if (
+            not current
+            or current["expires_at"] <= time.time()
+            or current["verify_attempts"] >= SIGNUP_OTP_VERIFY_LIMIT
+            or current["method"] != method
+            or not secrets.compare_digest(current["otp_hash"], expected_hash)
+        ):
+            db.rollback()
+            flash("That code is no longer valid. Request a new one to continue.", "error")
+            return redirect(url_for("verify_signup"))
+        db.execute("UPDATE users SET email_verified=1 WHERE id=?", (user_id,))
+        db.execute("DELETE FROM signup_verification_otps WHERE user_id=?", (user_id,))
+        db.commit()
+        session.pop("signup_verification_user_id", None)
+        session.pop("signup_verification_method", None)
+        session.pop("signup_csrf_token", None)
+        flash("Your account is verified. You can now sign in.", "success")
+        return redirect(url_for("web_login"))
+
+    return render_template(
+        "verify_signup.html",
+        method=method,
+        masked_destination=_masked_destination(method, destination),
+        csrf_token=session["signup_csrf_token"],
+        otp_expires=OTP_LIFETIME_SECONDS // 60,
+        resend_cooldown=OTP_RESEND_COOLDOWN_SECONDS,
+        resend_wait=resend_wait,
+        code_expired=code_expired,
+        code_available=bool(otp_row),
+    )
+
+
+@app.post("/logout")
+@login_required
+@mutation_required
 def web_logout():
     session.clear()
     flash("You have been logged out.", "success")
@@ -717,10 +1653,14 @@ def google_login():
     db = get_db()
     user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
     if user is None:
-        uid = db.execute(
-            "INSERT INTO users(email,password_hash) VALUES (?,?)",
-            (email, generate_password_hash(secrets.token_urlsafe(32))),
-        ).lastrowid
+        db.execute("BEGIN IMMEDIATE")
+        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+    if user is None:
+        uid = _next_user_id(db)
+        db.execute(
+            "INSERT INTO users(id,email,password_hash,email_verified) VALUES (?,?,?,1)",
+            (uid, email, generate_password_hash(secrets.token_urlsafe(32))),
+        )
         db.execute(
             "INSERT INTO profiles(user_id,display_name) VALUES (?,?)",
             (uid, name or email.split("@")[0]),
@@ -728,11 +1668,18 @@ def google_login():
         db.execute("INSERT INTO streaks(user_id) VALUES (?)", (uid,))
     else:
         uid = user["id"]
+        db.execute("UPDATE users SET email_verified=1 WHERE id=?", (uid,))
+        db.execute("DELETE FROM signup_verification_otps WHERE user_id=?", (uid,))
         if name:
             db.execute("UPDATE profiles SET display_name=? WHERE user_id=?", (name, uid))
     db.commit()
     session.clear()
     session["user_id"] = uid
+    authenticated = db.execute(
+        "SELECT auth_version FROM users WHERE id=?",
+        (uid,),
+    ).fetchone()
+    session["auth_version"] = authenticated["auth_version"]
     session["csrf_token"] = secrets.token_urlsafe(32)
     return jsonify({"ok": True, "redirect": url_for("dashboard")})
 
@@ -898,6 +1845,10 @@ def round_page(round_number):
     if not session.get("role_id"):
         flash("Select a role before starting an official round.", "error")
         return redirect(url_for("select_role"))
+    previous_round2_coding_id = None
+    if round_number == 2 and request.args.get("retest") == "1":
+        previous_round2_coding_id = session.pop("official_round2_coding_question_id", None)
+        session.pop("official_round2_coding_passed", None)
     if round_number > 1 and not db.execute("SELECT 1 FROM assessment_attempts WHERE user_id=? AND round_number=? AND status='passed'", (session["user_id"], round_number - 1)).fetchone():
         flash(f"Round {round_number} is locked. Pass Round {round_number - 1} first.", "error")
         return redirect(url_for("placement"))
@@ -955,16 +1906,51 @@ def round_page(round_number):
     if request.method == "POST":
         answers = [request.form.get(f"answer_{q['id']}", "").strip() for q in questions]
         correct = sum(answer == q["correct_answer"] for answer, q in zip(answers, questions))
-        answered = sum(bool(answer) for answer in answers)
-        score = round(correct / len(questions) * 10, 2)
-        status = "passed" if score >= 6 else "failed"
+        if round_number == 2:
+            coding_passed = session.get("official_round2_coding_passed") is True
+            score = round((correct / len(questions) * 8) + (2 if coding_passed else 0), 2)
+            status = "passed" if score >= 6 and coding_passed else "failed"
+            saved_answers = {
+                "technical_answers": answers,
+                "coding_question_id": session.get("official_round2_coding_question_id"),
+                "coding_passed": coding_passed,
+                "coding_points": 2 if coding_passed else 0,
+            }
+        else:
+            score = round(correct / len(questions) * 10, 2)
+            status = "passed" if score >= 6 else "failed"
+            saved_answers = answers
         db.execute("INSERT INTO assessment_attempts(user_id,role_id,mode,round_number,status,score,answers_json) VALUES (?,?, 'official', ?,?,?,?)",
-                   (session["user_id"], session["role_id"], round_number, status, score, json.dumps(answers)))
+                   (session["user_id"], session["role_id"], round_number, status, score, json.dumps(saved_answers)))
         db.commit()
         session.pop(f"official_round_{round_number}_questions", None)
         session.pop(f"official_round_{round_number}_options", None)
-        flash(f"Round {round_number} {'passed' if status == 'passed' else 'submitted'} with a score of {score}/10.", "success" if status == "passed" else "error")
+        if round_number == 2:
+            session.pop("official_round2_coding_question_id", None)
+            session.pop("official_round2_coding_passed", None)
+        message = f"Round {round_number} {'passed' if status == 'passed' else 'submitted'} with a score of {score}/10."
+        if round_number == 2 and not coding_passed:
+            message += " Pass the coding task to unlock Round 3."
+        flash(message, "success" if status == "passed" else "error")
         return redirect(url_for("placement"))
+    round2_coding_question = None
+    if round_number == 2:
+        coding_question_id = session.get("official_round2_coding_question_id")
+        round2_coding_question = next(
+            (item for item in CODING_QUESTIONS if item["id"] == coding_question_id),
+            None,
+        )
+        if not round2_coding_question:
+            company = selected_company_name(db, session["role_id"])
+            company_questions = [
+                item for item in CODING_QUESTIONS
+                if company in item["companies"]
+            ]
+            pool = company_questions or CODING_QUESTIONS
+            if len(pool) > 1 and previous_round2_coding_id:
+                pool = [item for item in pool if item["id"] != previous_round2_coding_id]
+            round2_coding_question = random.choice(pool)
+            session["official_round2_coding_question_id"] = round2_coding_question["id"]
     display_questions = []
     option_key = f"official_round_{round_number}_options"
     saved_options = session.get(option_key, {})
@@ -988,6 +1974,12 @@ def round_page(round_number):
         ).fetchone(),
         duration=20,
         total=expected_count,
+        round2_coding_question=round2_coding_question,
+        coding_completed=session.get("official_round2_coding_passed") is True,
+        languages=LANGUAGES,
+        starter_code=STARTER_CODE,
+        sandbox_available=bool(CODE_SANDBOX_URL),
+        csrf_token=session.get("csrf_token", ""),
     )
 
 
@@ -995,6 +1987,97 @@ def round_page(round_number):
 @login_required
 def practice():
     return render_template("practice.html")
+
+
+def _coding_session_questions(run):
+    by_id = {question["id"]: question for question in CODING_QUESTIONS}
+    return [by_id[question_id] for question_id in run["question_ids"] if question_id in by_id]
+
+
+@app.get("/coding")
+@login_required
+def coding_round():
+    run = session.get("coding_session")
+    if not run or not _coding_session_questions(run):
+        questions = random.sample(CODING_QUESTIONS, 5)
+        run = {
+            "question_ids": [question["id"] for question in questions],
+            "difficulty": "mixed",
+            "completed": [],
+            "company": "",
+        }
+        session["coding_session"] = run
+    questions = _coding_session_questions(run)
+    active_id = request.args.get("question", questions[0]["id"])
+    if active_id not in run["question_ids"]:
+        active_id = questions[0]["id"]
+    return render_template(
+        "coding.html",
+        questions=questions,
+        active_id=active_id,
+        coding_session=run,
+        languages=LANGUAGES,
+        starter_code=STARTER_CODE,
+        coding_companies=sorted({
+            company for item in CODING_QUESTIONS for company in item["companies"]
+        }),
+        sandbox_available=bool(CODE_SANDBOX_URL),
+        csrf_token=session.get("csrf_token", ""),
+    )
+
+
+@app.post("/coding/start")
+@login_required
+@mutation_required
+def start_coding_session():
+    difficulty = request.form.get("difficulty", "mixed").lower()
+    if difficulty not in {"mixed", "easy", "medium", "hard"}:
+        flash("Choose a valid coding difficulty.", "error")
+        return redirect(url_for("coding_round"))
+    try:
+        count = int(request.form.get("count", "5"))
+    except ValueError:
+        flash("Choose a valid question count.", "error")
+        return redirect(url_for("coding_round"))
+    if count not in {3, 5, 8}:
+        flash("Choose 3, 5, or 8 questions.", "error")
+        return redirect(url_for("coding_round"))
+    company = request.form.get("company", "").strip()
+    available_companies = {
+        name for question in CODING_QUESTIONS for name in question["companies"]
+    }
+    if company and company not in available_companies:
+        flash("Choose a company from the list.", "error")
+        return redirect(url_for("coding_round"))
+    candidates = [
+        question for question in CODING_QUESTIONS
+        if (difficulty == "mixed" or question["difficulty"] == difficulty)
+        and (not company or company in question["companies"])
+    ]
+    if not candidates:
+        flash("No questions match those filters yet.", "error")
+        return redirect(url_for("coding_round"))
+    selected = random.sample(candidates, min(count, len(candidates)))
+    previous_ids = set((session.get("coding_session") or {}).get("question_ids", []))
+    selected_ids = {question["id"] for question in selected}
+    if len(candidates) > len(selected) and selected_ids == previous_ids:
+        removed_id = random.choice(tuple(previous_ids))
+        replacement = random.choice([
+            question for question in candidates if question["id"] not in previous_ids
+        ])
+        retained = [
+            question for question in candidates
+            if question["id"] in previous_ids and question["id"] != removed_id
+        ]
+        selected = random.sample(retained + [replacement], len(selected))
+    session["coding_session"] = {
+        "question_ids": [question["id"] for question in selected],
+        "difficulty": difficulty,
+        "completed": [],
+        "company": company,
+    }
+    flash(f"Your new coding session is ready with {len(selected)} unique questions.", "success")
+    return redirect(url_for("coding_round"))
 
 
 @app.get("/resume")
@@ -1112,42 +2195,48 @@ def about():
 
 @app.post("/api/register")
 def register():
+    if session.get("user_id"):
+        return json_error("Sign out before creating another account.", 409)
     try:
         data = request_data()
-        email = str(data.get("email", "")).strip().lower()
-        password = str(data.get("password", ""))
-        confirm_password = str(data.get("confirm_password", ""))
-        name = str(data.get("name", "")).strip()[:80]
-        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-            return json_error("Enter a valid email address.")
-        if not name:
-            return json_error("Enter your full name.")
-        if len(password) < 8 or len(password) > 128:
-            return json_error("Password must be 8–128 characters.")
-        if not re.search(r"[A-Z]", password) or not re.search(r"[a-z]", password):
-            return json_error("Password must include uppercase and lowercase letters.")
-        if not re.search(r"\d", password) or not re.search(r"[^A-Za-z0-9]", password):
-            return json_error("Password must include a number and a special character.")
-        if password != confirm_password:
-            return json_error("Passwords do not match.")
-        email_name = email.split("@", 1)[0].lower()
-        if email_name and email_name in password.lower():
-            return json_error("Password must not contain your email name.")
-        if len(name) >= 3 and name.lower() in password.lower():
-            return json_error("Password must not contain your name.")
-        db = get_db()
-        cur = db.execute("INSERT INTO users(email,password_hash) VALUES (?,?)",
-                         (email, generate_password_hash(password)))
-        uid = cur.lastrowid
-        db.execute("INSERT INTO profiles(user_id,display_name) VALUES (?,?)", (uid, name))
-        db.execute("INSERT INTO streaks(user_id) VALUES (?)", (uid,))
-        db.commit()
-        session.clear()
-        session["user_id"] = uid
-        session["csrf_token"] = secrets.token_urlsafe(32)
-        return jsonify({"ok": True, "csrf_token": session["csrf_token"]}), 201
+        csrf = session.get("signup_csrf_token", "")
+        submitted_csrf = request.headers.get("X-CSRF-Token", "")
+        if not csrf or not secrets.compare_digest(csrf, submitted_csrf):
+            return json_error("Invalid signup CSRF token.", 403)
+        created = _create_signup_account(data)
+        if created[0] is None:
+            if created[1] == "duplicate_email":
+                return json_error("An account with that email already exists.", 409)
+            return json_error("That phone number is already linked to an account.", 409)
+        uid, delivery, method = created
+        session["signup_verification_user_id"] = uid
+        session["signup_verification_method"] = method
+        session.setdefault("signup_csrf_token", secrets.token_urlsafe(32))
+        if delivery != "sent":
+            message = {
+                "cooldown": "A verification code was sent recently. Wait before requesting another.",
+                "rate_limited": "Too many verification code requests. Please wait before trying again.",
+                "delivery_failed": f"We could not send a code by {method_label(method)}. Configure the verification service and retry later.",
+            }[delivery]
+        else:
+            message = f"A verification code was sent by {method_label(method)}."
+        return jsonify({
+            "ok": True,
+            "verification_required": True,
+            "verification_method": method,
+            "message": message,
+            "redirect": url_for("verify_signup"),
+        }), 202
     except sqlite3.IntegrityError:
-        return json_error("An account with that email already exists.", 409)
+        db = get_db()
+        db.rollback()
+        email = str(data.get("email", "")).strip().lower()
+        if db.execute("SELECT 1 FROM users WHERE email=?", (email,)).fetchone():
+            return json_error("An account with that email already exists.", 409)
+        app.logger.exception("API account registration failed due to a database constraint.")
+        return json_error("We could not create your account right now. Please try again.", 500)
+    except (TypeError, ValueError) as exc:
+        return json_error(str(exc))
 
 
 @app.post("/api/login")
@@ -1157,12 +2246,33 @@ def login():
         email, password = str(data.get("email", "")).strip().lower(), str(data.get("password", ""))
     except ValueError as exc:
         return json_error(str(exc))
-    user = get_db().execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
-    if not user or not check_password_hash(user["password_hash"], password):
+    if len(email) > 254 or len(password) > 128:
         return json_error("Email or password is incorrect.", 401)
-    session.clear()
-    session["user_id"] = user["id"]
-    session["csrf_token"] = secrets.token_urlsafe(32)
+    user, retry_after, reason = _authenticate_login(email, password)
+    if retry_after:
+        response = json_error(
+            f"Too many unsuccessful attempts. Please try again in about {max(1, (retry_after + 59) // 60)} minute(s).",
+            429,
+        )
+        response[0].headers["Retry-After"] = str(retry_after)
+        return response
+    if reason == "unverified" and user:
+        challenge = get_db().execute(
+            "SELECT method FROM signup_verification_otps WHERE user_id=?",
+            (user["id"],),
+        ).fetchone()
+        method = challenge["method"] if challenge else "email"
+        session["signup_verification_user_id"] = user["id"]
+        session["signup_verification_method"] = method
+        session.setdefault("signup_csrf_token", secrets.token_urlsafe(32))
+        return jsonify({
+            "error": f"Verify your {('email address' if method == 'email' else 'mobile number')} before signing in.",
+            "verification_required": True,
+            "redirect": url_for("verify_signup"),
+        }), 403
+    if not user:
+        return json_error("Email or password is incorrect.", 401)
+    _set_authenticated_session(user)
     return jsonify({"ok": True, "csrf_token": session["csrf_token"]})
 
 
@@ -1220,6 +2330,146 @@ def catalog():
         "SELECT id, name, description FROM companies ORDER BY name"
     ).fetchall()]
     return jsonify({"roles": [dict(r) for r in rows], "role_names": role_names, "companies": companies})
+
+
+@app.post("/api/coding/execute")
+@login_required
+@mutation_required
+def execute_coding_question():
+    if not CODE_SANDBOX_URL:
+        return json_error(
+            "Code execution is not configured. Connect a trusted Piston-compatible sandbox using CODE_SANDBOX_URL; code is never run on the InterviewForge server.",
+            503,
+        )
+    try:
+        data = request_data()
+        question_id = str(data.get("question_id", ""))
+        language = str(data.get("language", ""))
+        code = data.get("code")
+        action = str(data.get("action", "run"))
+        mode = str(data.get("mode", "practice"))
+        run = session.get("coding_session") or {}
+        official_round2 = (
+            mode == "official_round2"
+            and question_id == session.get("official_round2_coding_question_id")
+        )
+        if mode not in {"practice", "official_round2"}:
+            return json_error("Invalid coding session.")
+        if not official_round2 and (
+            mode != "practice" or question_id not in run.get("question_ids", [])
+        ):
+            return json_error("That question is not part of your active coding session.", 404)
+        if language not in LANGUAGES:
+            return json_error("Choose C, C++, Java, JavaScript, or Python.")
+        if not isinstance(code, str) or not code.strip() or len(code) > 20_000:
+            return json_error("Code must contain between 1 and 20,000 characters.")
+        if action not in {"run", "submit"}:
+            return json_error("Choose Run Code or Submit Code.")
+        question = next(item for item in CODING_QUESTIONS if item["id"] == question_id)
+    except (ValueError, TypeError, StopIteration):
+        return json_error("Invalid coding request.")
+
+    parsed_url = urlsplit(CODE_SANDBOX_URL)
+    if (
+        parsed_url.scheme not in {"http", "https"}
+        or not parsed_url.hostname
+        or parsed_url.username
+        or parsed_url.password
+        or (parsed_url.scheme != "https" and parsed_url.hostname not in {"localhost", "127.0.0.1", "::1"})
+    ):
+        app.logger.error("Configured code sandbox URL is invalid or not HTTPS.")
+        return json_error("The configured sandbox URL must use HTTPS (HTTP is allowed only for localhost).", 503)
+
+    language_info = LANGUAGES[language]
+    endpoint = f"{CODE_SANDBOX_URL}/api/v2/execute"
+    headers = {"Content-Type": "application/json"}
+    if CODE_SANDBOX_API_KEY:
+        headers["Authorization"] = f"Bearer {CODE_SANDBOX_API_KEY}"
+    results = []
+    test_cases = question["tests"][:1] if action == "run" else question["tests"]
+    for case in test_cases:
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json={
+                    "language": language_info["piston_language"],
+                    "version": "*",
+                    "files": [{"name": language_info["filename"], "content": code}],
+                    "stdin": case["input"],
+                },
+                timeout=(3, 10),
+                allow_redirects=False,
+            )
+            if response.status_code < 200 or response.status_code >= 300:
+                app.logger.warning("Code sandbox returned HTTP %s.", response.status_code)
+                return json_error("The configured sandbox could not execute this request.", 502)
+            payload = response.json()
+            execution = payload.get("run", {})
+            compile_result = payload.get("compile", {})
+            stdout = str(execution.get("stdout", ""))[:10_000]
+            stderr = str(compile_result.get("stderr", "") or execution.get("stderr", ""))[:4_000]
+            passed = execution.get("code") == 0 and stdout.strip() == case["output"].strip()
+            results.append({
+                "passed": passed,
+                "expected": case["output"],
+                "actual": stdout,
+                "stderr": stderr,
+            })
+        except requests.RequestException:
+            app.logger.exception("Code sandbox request failed.")
+            return json_error("The configured sandbox is unavailable. Please try again shortly.", 502)
+        except (ValueError, AttributeError, TypeError):
+            app.logger.exception("Code sandbox returned an invalid response.")
+            return json_error("The configured sandbox returned an invalid response.", 502)
+
+    passed_count = sum(result["passed"] for result in results)
+    is_correct = passed_count == len(results)
+    submission_passed = action == "submit" and is_correct and len(results) == len(question["tests"])
+    if official_round2 and submission_passed:
+        session["official_round2_coding_passed"] = True
+    completed = set(run.get("completed", []))
+    newly_completed = not official_round2 and submission_passed and question_id not in completed
+    if newly_completed:
+        completed.add(question_id)
+        run["completed"] = list(completed)
+        session["coding_session"] = run
+        if len(completed) == len(run["question_ids"]) and not run.get("saved"):
+            db = get_db()
+            score = round(len(completed) / len(run["question_ids"]) * 10, 2)
+            db.execute(
+                "INSERT INTO interview_sessions(user_id,mode,transcript_json,score) VALUES (?,?,?,?)",
+                (
+                    session["user_id"],
+                    "coding",
+                    json.dumps({"question_ids": run["question_ids"], "completed": sorted(completed)}),
+                    score,
+                ),
+            )
+            db.execute(
+                "INSERT INTO xp_events(user_id,amount,reason) VALUES (?,?,?)",
+                (session["user_id"], 50, "Completed coding practice session"),
+            )
+            db.commit()
+            run["saved"] = True
+            session["coding_session"] = run
+    return jsonify({
+        "results": results,
+        "passed": is_correct,
+        "score": (
+            round(len(run.get("completed", [])) / len(run["question_ids"]) * 10, 2)
+            if run.get("question_ids") else 0
+        ),
+        "completed": sorted(run.get("completed", [])),
+        "session_complete": bool(run.get("question_ids")) and (
+            len(run.get("completed", [])) == len(run["question_ids"])
+        ),
+        "newly_completed": newly_completed,
+        "coding_completed": (
+            session.get("official_round2_coding_passed") is True
+            if official_round2 else None
+        ),
+    })
 
 
 @app.post("/api/resume")

@@ -14,17 +14,18 @@
   <form method="post" class="auth-form" data-auth-form>
     <label class="field">
       <span>Email address</span>
-      <input name="email" type="email" autocomplete="email" required autofocus>
+      <input name="email" type="email" maxlength="254" autocomplete="email" required autofocus>
     </label>
     <label class="field">
       <span>Password</span>
       <span class="password-control">
-        <input name="password" type="password" autocomplete="current-password" required>
+        <input name="password" type="password" minlength="8" maxlength="128" autocomplete="current-password" required>
         <button type="button" class="password-toggle" data-password-toggle
           data-show-label="Show password" data-hide-label="Hide password"
           aria-label="Show password" aria-pressed="false">Show</button>
       </span>
     </label>
+    <p class="auth-help"><a href="{{ url_for('forgot_password') }}">Forgot Password?</a></p>
     <button class="btn-primary auth-submit" type="submit">
       <span class="auth-submit-label">Sign in →</span>
       <span class="auth-spinner" aria-hidden="true"></span>

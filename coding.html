@@ -1,0 +1,112 @@
+{% extends "layout.html" %}
+{% block title %}Coding round · InterviewForge{% endblock %}
+{% block content %}
+<section class="coding-page">
+  <header class="coding-header">
+    <div>
+      <p class="kicker">Practice lab · {{ questions|length }} unique questions</p>
+      <h1>Make a little progress.</h1>
+      <p>Work through a fresh set of coding problems, one clear step at a time.</p>
+    </div>
+    <form method="post" action="{{ url_for('start_coding_session') }}" class="coding-new-session">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <label class="field">
+        <span>Difficulty</span>
+        <select name="difficulty">
+          <option value="mixed" {% if coding_session.difficulty == "mixed" %}selected{% endif %}>A little of everything</option>
+          <option value="easy" {% if coding_session.difficulty == "easy" %}selected{% endif %}>Easy</option>
+          <option value="medium" {% if coding_session.difficulty == "medium" %}selected{% endif %}>Medium</option>
+          <option value="hard" {% if coding_session.difficulty == "hard" %}selected{% endif %}>Hard</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Company</span>
+        <select name="company">
+          <option value="" {% if not coding_session.company %}selected{% endif %}>General placement</option>
+          {% for company in coding_companies %}
+          <option value="{{ company }}" {% if coding_session.company == company %}selected{% endif %}>{{ company }}</option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="field">
+        <span>Questions</span>
+        <select name="count"><option>3</option><option selected>5</option><option>8</option></select>
+      </label>
+      <button class="btn-secondary" type="submit">New session ↻</button>
+    </form>
+  </header>
+
+  <div class="coding-progress panel">
+    <div class="coding-progress-copy">
+      <div><span class="kicker">Your session</span><strong><span data-completed-count>{{ coding_session.completed|length }}</span> / {{ questions|length }} solved</strong></div>
+      <div class="coding-clock"><span class="kicker">Time left</span><strong data-coding-timer>30:00</strong></div>
+      <div class="coding-score"><span class="kicker">Score</span><strong><span data-coding-score>{{ (coding_session.completed|length / questions|length * 10)|round(1) }}</span> / 10</strong></div>
+    </div>
+    <p class="coding-company-note">
+      {% if coding_session.company %}Questions selected for {{ coding_session.company }}.{% else %}General placement question set.{% endif %}
+    </p>
+    <div class="progress-track"><span data-coding-progress style="width: {{ (coding_session.completed|length / questions|length * 100)|round|int }}%"></span></div>
+  </div>
+
+  <div class="sandbox-note {% if sandbox_available %}sandbox-ready{% endif %}" role="status">
+    {% if sandbox_available %}
+    A trusted sandbox is configured. Run and submit send your source to that service for isolated execution.
+    {% else %}
+    Your editor is ready. To run code, configure <code>CODE_SANDBOX_URL</code> with your trusted, sandboxed Piston-compatible execution service. InterviewForge never executes submitted code on its own server.
+    {% endif %}
+  </div>
+
+  <div class="coding-workspace">
+    <aside class="coding-question-rail panel" aria-label="Questions in this session">
+      <p class="kicker">Problem set</p>
+      <div class="coding-question-list">
+        {% for question in questions %}
+        <button type="button" class="coding-question-link" data-question-link="{{ question.id }}" aria-current="{{ 'true' if question.id == active_id else 'false' }}">
+          <span class="coding-link-number">0{{ loop.index }}</span>
+          <span><strong>{{ question.title }}</strong><small>{{ question.topic }} · {{ question.difficulty|capitalize }} · {{ question.companies|join(", ") }}</small></span>
+          <span class="coding-solved" data-solved-indicator="{{ question.id }}" {% if question.id not in coding_session.completed %}hidden{% endif %}>✓</span>
+        </button>
+        {% endfor %}
+      </div>
+    </aside>
+
+    <article class="coding-problem panel">
+      <div class="problem-heading">
+        <div><p class="kicker" data-problem-topic></p><h2 data-problem-title></h2><small data-problem-companies></small></div>
+        <span class="difficulty-badge" data-problem-difficulty></span>
+      </div>
+      <div class="problem-statement" data-problem-statement></div>
+      <section class="problem-section"><h3>Examples &amp; test cases</h3><div data-problem-examples></div></section>
+      <section class="problem-section"><h3>Constraints</h3><ul data-problem-constraints></ul></section>
+    </article>
+
+    <section class="coding-editor panel">
+      <header class="editor-toolbar">
+        <label class="field">
+          <span>Language</span>
+          <select data-language>
+            {% for key, language in languages.items() %}<option value="{{ key }}">{{ language.label }}</option>{% endfor %}
+          </select>
+        </label>
+        <button class="btn-secondary editor-reset" type="button" data-reset-code>Reset code</button>
+      </header>
+      <label class="field editor-field">
+        <span class="sr-only">Code editor</span>
+        <textarea data-code-editor spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Code editor"></textarea>
+      </label>
+      <div class="editor-actions">
+        <button class="btn-secondary" type="button" data-run-code>Run Code</button>
+        <button class="btn-primary" type="button" data-submit-code>Submit Code</button>
+      </div>
+      <div class="coding-output" data-coding-output aria-live="polite">
+        <div class="output-heading"><h3>Output</h3><span data-output-status>Ready when you are</span></div>
+        <div data-output-results class="output-results">Run a sample test to see your output.</div>
+      </div>
+    </section>
+  </div>
+</section>
+<script id="coding-questions" type="application/json">{{ questions|tojson }}</script>
+<script id="coding-starters" type="application/json">{{ starter_code|tojson }}</script>
+<script>window.codingCsrfToken = {{ csrf_token|tojson }};</script>
+<script src="{{ url_for('static', filename='coding.js') }}" defer></script>
+{% endblock %}

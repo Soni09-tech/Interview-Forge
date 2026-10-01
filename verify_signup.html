@@ -1,0 +1,45 @@
+{% extends "layout.html" %}
+{% block title %}Verify account · InterviewForge{% endblock %}
+{% block content %}
+<section class="auth-card auth-gate">
+  <p class="kicker">One last step</p>
+  <h1>Verify your account</h1>
+  <p class="auth-lede">
+    {% if code_available %}
+      {% if code_expired %}
+      The previous code has expired. Request a new one to continue.
+      {% else %}
+      Enter the six-digit code sent by {{ "email" if method == "email" else "text message" }}
+      to <strong>{{ masked_destination }}</strong>. It expires in {{ otp_expires }} minutes.
+      {% endif %}
+    {% else %}
+    No active code is available. Request one below to verify
+    <strong>{{ masked_destination }}</strong>.
+    {% endif %}
+  </p>
+  <form method="post" class="auth-form">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="verify">
+    <label class="field">
+      <span>Verification code</span>
+      <input name="otp" type="text" inputmode="numeric" pattern="[0-9]{6}"
+             minlength="6" maxlength="6" autocomplete="one-time-code" required autofocus>
+    </label>
+    <button class="btn-primary auth-submit" type="submit">Verify account</button>
+  </form>
+  <form method="post" class="auth-resend">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <input type="hidden" name="action" value="resend">
+    <button class="btn-secondary" type="submit">Resend code</button>
+    <small>
+      {% if resend_wait %}
+      Resend is available in {{ resend_wait }} seconds.
+      {% else %}
+      Request a code when you are ready.
+      {% endif %}
+      Codes expire after {{ otp_expires }} minutes; verification allows five attempts.
+    </small>
+  </form>
+  <p class="auth-switch"><a href="{{ url_for('web_login') }}">Return to sign in</a></p>
+</section>
+{% endblock %}

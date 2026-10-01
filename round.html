@@ -4,7 +4,13 @@
 <section class="panel">
   <p class="kicker">Round {{ round_number }} · {{ selected.name }} at {{ selected.company }}</p>
   <h1>{{ total }}-question assessment</h1>
-  <p>Campus-placement aptitude and analytical reasoning. Choose one answer for every question. You have {{ duration }} minutes; a score of 60% unlocks the next round.</p>
+  <p>
+    {% if round_number == 2 %}
+    Answer the technical questions and pass the coding task below. Round 2 combines both parts; the coding task is verified by the configured sandbox.
+    {% else %}
+    Campus-placement aptitude and analytical reasoning. Choose one answer for every question. You have {{ duration }} minutes; a score of 60% unlocks the next round.
+    {% endif %}
+  </p>
   <form method="post" id="assessment-form">
     <div id="question-progress" class="question-progress" aria-live="polite"></div>
     {% for question in questions %}
@@ -12,10 +18,54 @@
       <legend>{{ loop.index }}. {{ question.prompt }} <span class="difficulty-badge difficulty-{{ question.difficulty }}">{{ question.difficulty|capitalize }}</span></legend>
       <small class="question-category">{{ question.category }}</small>
       {% for option in question.options_json|from_json %}
-      <label class="option"><input type="radio" name="answer_{{ question.id }}" value="{{ option }}" required><span>{{ option }}</span></label>
+      <label class="option"><input type="radio" name="answer_{{ question.id }}" value="{{ option }}"><span>{{ option }}</span></label>
       {% endfor %}
     </fieldset>
     {% endfor %}
+    {% if round_number == 2 and round2_coding_question %}
+    <section class="round-coding-task panel" aria-labelledby="round-coding-title">
+      <div class="problem-heading">
+        <div>
+          <p class="kicker">Round 2 coding task · {{ round2_coding_question.topic }}</p>
+          <h2 id="round-coding-title">{{ round2_coding_question.title }}</h2>
+          <small>Company practice tags: {{ round2_coding_question.companies|join(", ") }}</small>
+        </div>
+        <span class="difficulty-badge difficulty-{{ round2_coding_question.difficulty }}">{{ round2_coding_question.difficulty|capitalize }}</span>
+      </div>
+      <p class="problem-statement">{{ round2_coding_question.statement }}</p>
+      <div class="round-coding-examples">
+        {% for example in round2_coding_question.examples %}
+        <article class="example-case">
+          <strong>Example {{ loop.index }}</strong>
+          <div class="example-io"><pre>{{ example.input }}</pre><pre>{{ example.output }}</pre></div>
+        </article>
+        {% endfor %}
+      </div>
+      <ul class="round-coding-constraints">
+        {% for constraint in round2_coding_question.constraints %}<li>{{ constraint }}</li>{% endfor %}
+      </ul>
+      <div class="round-coding-editor">
+        <label class="field">
+          <span>Language</span>
+          <select data-round2-language>
+            {% for key, language in languages.items() %}<option value="{{ key }}">{{ language.label }}</option>{% endfor %}
+          </select>
+        </label>
+        <label class="field">
+          <span>Code</span>
+          <textarea data-round2-code spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Round 2 coding solution"></textarea>
+        </label>
+        <div class="editor-actions">
+          <button type="button" class="btn-secondary" data-round2-run>Run sample</button>
+          <button type="button" class="btn-primary" data-round2-submit>Submit code</button>
+        </div>
+        <pre class="round-coding-output" data-round2-output aria-live="polite">Output appears after you run the sample.</pre>
+        <p class="round-coding-status" data-round2-status role="status">
+          {% if coding_completed %}Coding task passed. Submit the round when your answers are ready.{% elif sandbox_available %}Run the sample, then submit your solution to pass the coding task.{% else %}A sandbox is not configured. Run and submit require CODE_SANDBOX_URL; the app never executes code itself.{% endif %}
+        </p>
+      </div>
+    </section>
+    {% endif %}
     <div class="question-controls">
       <button type="button" class="btn-secondary" id="previous-question">Previous</button>
       <button type="button" class="btn-secondary" id="next-question">Next</button>
@@ -23,6 +73,14 @@
     </div>
   </form>
 </section>
+{% if round_number == 2 and round2_coding_question %}
+<script id="round2-starters" type="application/json">{{ starter_code|tojson }}</script>
+<script>window.round2CodingConfig = {{ {
+  "questionId": round2_coding_question.id,
+  "csrfToken": csrf_token,
+  "completed": coding_completed
+}|tojson }};</script>
+{% endif %}
 <script>
 (function () {
   const items = [...document.querySelectorAll(".paged-question")];
@@ -30,6 +88,7 @@
   const previous = document.getElementById("previous-question");
   const next = document.getElementById("next-question");
   const submit = document.getElementById("submit-round");
+  const form = document.getElementById("assessment-form");
   let current = 0;
   function render() {
     items.forEach((item, index) => { item.hidden = index !== current; });
@@ -44,7 +103,77 @@
   }
   previous.addEventListener("click", () => move(-1));
   next.addEventListener("click", () => move(1));
+  form.addEventListener("submit", event => {
+    const unanswered = items.findIndex(item => !item.querySelector('input[type="radio"]:checked'));
+    if (unanswered < 0) return;
+    event.preventDefault();
+    current = unanswered;
+    render();
+    progress.textContent = `Choose an answer for question ${current + 1} of ${items.length} before submitting.`;
+    items[current].querySelector('input[type="radio"]').focus();
+  });
   render();
 }());
 </script>
+{% if round_number == 2 and round2_coding_question %}
+<script>
+(() => {
+  const config = window.round2CodingConfig;
+  const starters = JSON.parse(document.getElementById("round2-starters").textContent);
+  const language = document.querySelector("[data-round2-language]");
+  const editor = document.querySelector("[data-round2-code]");
+  const status = document.querySelector("[data-round2-status]");
+  const output = document.querySelector("[data-round2-output]");
+  const runButton = document.querySelector("[data-round2-run]");
+  const submitButton = document.querySelector("[data-round2-submit]");
+  let busy = false;
+  editor.value = starters[language.value] || "";
+  language.addEventListener("change", () => { editor.value = starters[language.value] || ""; });
+  async function execute(action) {
+    if (busy) return;
+    busy = true;
+    runButton.disabled = true;
+    submitButton.disabled = true;
+    status.textContent = action === "submit" ? "Checking every test case…" : "Running the sample…";
+    try {
+      const response = await fetch("/api/coding/execute", {
+        method: "POST",
+        headers: {"Content-Type": "application/json", "X-CSRF-Token": config.csrfToken},
+        body: JSON.stringify({
+          mode: "official_round2",
+          question_id: config.questionId,
+          language: language.value,
+          code: editor.value,
+          action
+        })
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "The coding sandbox request failed.");
+      output.textContent = result.results.map((item, index) =>
+        `Test ${index + 1}: ${item.passed ? "passed" : "failed"}\nExpected:\n${item.expected}\n\nReceived:\n${item.actual}${item.stderr ? `\n\nCompiler/runtime message:\n${item.stderr}` : ""}`
+      ).join("\n\n");
+      const summary = result.results.every(item => item.passed)
+        ? "All submitted test cases passed."
+        : "One or more test cases did not pass.";
+      if (result.coding_completed) {
+        status.textContent = "Coding task passed. Submit the round when your answers are ready.";
+        status.classList.add("is-complete");
+      } else {
+        status.textContent = summary || "No test results were returned.";
+      }
+    } catch (error) {
+      status.textContent = error.message;
+      output.textContent = "The sandbox could not complete the request.";
+      status.classList.remove("is-complete");
+    } finally {
+      busy = false;
+      runButton.disabled = false;
+      submitButton.disabled = false;
+    }
+  }
+  runButton.addEventListener("click", () => execute("run"));
+  submitButton.addEventListener("click", () => execute("submit"));
+})();
+</script>
+{% endif %}
 {% endblock %}

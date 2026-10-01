@@ -1,1 +1,53 @@
-{% extends "layout.html" %}{% block title %}Round {{ round_number }} interview · InterviewForge{% endblock %}{% block content %}<section class="panel interview-panel"><p class="kicker">Round {{ round_number }} · {{ selected.name }} at {{ selected.company }}</p><h1>{% if round_number == 3 %}HR interview{% else %}Technical AI interview{% endif %}</h1><p>Camera and microphone permission are required. InterviewForge only uses your media stream for the live preview and does not secretly record you.</p><div id="media-error" class="flash error" hidden></div><video id="camera-preview" autoplay muted playsinline></video><div id="media-status" class="flash">Checking camera and microphone permissions…</div>{% if round_number == 4 and not ai_available %}<div class="flash error">AI service is not configured. Add <code>ANTHROPIC_API_KEY</code> to enable this interview.</div>{% elif questions %}<form method="post" id="interview-form">{% for question in questions %}<label class="field question"><span>{{ loop.index }}. {{ question }}</span><textarea name="answer_{{ loop.index0 }}" rows="4" required></textarea></label>{% endfor %}<button class="btn-primary" id="start-interview" disabled>Submit interview →</button></form>{% else %}<div class="flash error">AI service did not return a valid question set. Please try again.</div>{% endif %}</section><script>(async()=>{const video=document.getElementById('camera-preview'),status=document.getElementById('media-status'),button=document.getElementById('start-interview'),error=document.getElementById('media-error');try{const stream=await navigator.mediaDevices.getUserMedia({video:true,audio:true});video.srcObject=stream;status.textContent='Camera and microphone ready.';status.className='flash success';if(button)button.disabled=false;window.addEventListener('beforeunload',()=>stream.getTracks().forEach(track=>track.stop()));}catch(e){error.hidden=false;error.textContent='Camera and microphone access is required to start this official interview.';status.hidden=true;}})();</script>{% endblock %}
+{% extends "layout.html" %}
+{% block title %}Round {{ round_number }} interview · InterviewForge{% endblock %}
+{% block content %}
+<section class="interview-page">
+  <div class="interview-intro">
+    <p class="kicker">Round {{ round_number }} · {{ selected.name }} at {{ selected.company }}</p>
+    <h1>{% if round_number == 3 %}A thoughtful conversation{% else %}Technical interview{% endif %}</h1>
+    <p>Listen to each prompt or answer in your own words. Voice tools are optional; your written answers are always available.</p>
+  </div>
+  <div class="interview-tools panel">
+    <div class="interview-tools-copy">
+      <p class="kicker">Voice studio</p>
+      <h2>Find your rhythm</h2>
+      <p>Questions can be read aloud. Your browser provides speech recognition; InterviewForge does not store audio recordings.</p>
+    </div>
+    <div class="media-preview">
+      <video id="camera-preview" autoplay muted playsinline hidden></video>
+      <button class="btn-secondary" type="button" id="camera-toggle">Enable camera preview</button>
+      <p id="media-status" class="voice-status" aria-live="polite">Microphone access is requested only when you start recording.</p>
+    </div>
+  </div>
+  {% if round_number == 4 and not ai_available %}
+  <div class="flash error">AI service is not configured. Add <code>ANTHROPIC_API_KEY</code> to enable this interview.</div>
+  {% elif questions %}
+  <form method="post" id="interview-form" class="interview-question-list">
+    {% for question in questions %}
+    <article class="panel interview-question" data-interview-question>
+      <div class="interview-question-title">
+        <span class="question-number">0{{ loop.index }}</span>
+        <h2 data-question-text>{{ question }}</h2>
+      </div>
+      <div class="voice-controls" data-voice-controls>
+        <button class="btn-secondary" type="button" data-read-question>Read question</button>
+        <button class="btn-primary" type="button" data-start-recording>Start recording</button>
+        <button class="btn-secondary" type="button" data-stop-recording disabled>Stop</button>
+        <span class="recording-indicator" data-recording-indicator aria-live="polite"><i></i> Ready</span>
+        <span class="recording-timer" data-recording-timer>00:00</span>
+      </div>
+      <p class="voice-transcript" data-transcript aria-live="polite">Your spoken answer will appear here. You can edit it below.</p>
+      <label class="field answer-field">
+        <span>Your answer</span>
+        <textarea name="answer_{{ loop.index0 }}" rows="5" required placeholder="Write your answer, or use Start recording…"></textarea>
+      </label>
+    </article>
+    {% endfor %}
+    <button class="btn-primary interview-submit" id="start-interview" type="submit">Submit interview →</button>
+  </form>
+  {% else %}
+  <div class="flash error">A valid question set is not available right now. Please try again later.</div>
+  {% endif %}
+</section>
+<script src="{{ url_for('static', filename='voice.js') }}" defer></script>
+{% endblock %}
